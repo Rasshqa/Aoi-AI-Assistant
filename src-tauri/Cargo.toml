@@ -1,0 +1,37 @@
+[package]
+name = "ai-hypr-assistant"
+version = "0.1.0"
+description = "Lightweight 2D AI Desktop Assistant for CachyOS + Hyprland"
+authors = ["rasshqa"]
+edition = "2021"
+
+[lib]
+name = "ai_hypr_assistant_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP client untuk Gemini / OpenAI / OpenRouter / Ollama / Cloud Whisper
+reqwest = { version = "0.12", features = ["json", "multipart", "rustls-tls"], default-features = false }
+
+# Async channel untuk konfirmasi Red Tier
+tokio-util = { version = "0.7", features = [] }
+
+# Base64 decoder untuk upload custom sprite avatar
+base64 = "0.22"
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+panic = "abort"
+strip = true

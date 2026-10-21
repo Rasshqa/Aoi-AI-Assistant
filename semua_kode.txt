@@ -1,0 +1,3471 @@
+==> src-tauri/src/avatar.rs <==
+// src-tauri/src/avatar.rs
+// Modul Pengelola Custom Avatar Sprite 2D
+// Menyimpan dan membaca frame gambar kustom di ~/.config/aoi/avatar/
+// Mendukung format PNG, WebP, SVG, JPG.
+
+use std::collections::HashMap;
+use std::fs;
+use std::path::{Path, PathBuf};
+use base64::prelude::*;
+
+const FRAME_NAMES: &[&str] = &[
+    "idle_open",
+    "idle_blink",
+    "listening",
+    "thinking",
+    "speak_open",
+    "speak_closed",
+    "confirm",
+    "error",
+];
+
+pub fn get_avatar_dir() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    PathBuf::from(home).join(".config/aoi/avatar")
+}
+
+/// Simpan satu frame sprite (dari data URL base64) ke disk dan perbarui manifest.json
+pub fn save_avatar_sprite(frame_name: &str, data_url: &str) -> Result<String, String> {
+    if !FRAME_NAMES.contains(&frame_name) {
+        return Err(format!("Nama frame '{}' tidak valid.", frame_name));
+    }
+
+    let dir = get_avatar_dir();
+    fs::create_dir_all(&dir)
+        .map_err(|e| format!("Gagal membuat direktori avatar {:?}: {}", dir, e))?;
+
+    // Pisahkan header data URL jika ada (e.g. "data:image/png;base64,...")
+    let (mime, raw_b64) = if let Some(idx) = data_url.find(";base64,") {
+        let prefix = &data_url[..idx];
+        let mime = prefix.strip_prefix("data:").unwrap_or("image/png");
+        let b64 = &data_url[idx + 8..];
+        (mime, b64)
+    } else {
+        ("image/png", data_url)
+    };
+
+    let ext = match mime {
+        "image/webp" => "webp",
+        "image/jpeg" | "image/jpg" => "jpg",
+        "image/svg+xml" => "svg",
+        _ => "png",
+    };
+
+    let bytes = BASE64_STANDARD
+        .decode(raw_b64.trim())
+        .map_err(|e| format!("Gagal decode base64: {}", e))?;
+
+    let file_path = dir.join(format!("{}.{}", frame_name, ext));
+    fs::write(&file_path, bytes)
+        .map_err(|e| format!("Gagal menulis file avatar {:?}: {}", file_path, e))?;
+
+    // Update manifest.json agar memuat data_url lengkap
+    let mut manifest = load_manifest(&dir);
+    manifest.insert(frame_name.to_string(), data_url.to_string());
+    save_manifest(&dir, &manifest)?;
+
+    Ok(data_url.to_string())
+}
+
+/// Simpan sekumpulan frame kustom sekaligus
+pub fn save_avatar_pack(pack: HashMap<String, String>) -> Result<(), String> {
+    let dir = get_avatar_dir();
+    fs::create_dir_all(&dir)
+        .map_err(|e| format!("Gagal membuat direktori avatar: {}", e))?;
+
+    for (k, v) in &pack {
+        if !v.is_empty() {
+            let _ = save_avatar_sprite(k, v);
+        }
+    }
+    Ok(())
+}
+
+/// Muat seluruh frame kustom yang tersimpan
+pub fn load_avatar_pack(folder_override: Option<String>) -> Result<HashMap<String, String>, String> {
+    let dir = if let Some(ref path_str) = folder_override {
+        if !path_str.trim().is_empty() {
+            PathBuf::from(path_str.trim())
+        } else {
+            get_avatar_dir()
+        }
+    } else {
+        get_avatar_dir()
+    };
+
+    if !dir.exists() {
+        return Ok(HashMap::new());
+    }
+
+    // 1. Cek apakah ada manifest.json yang menyimpan data URL
+    let manifest = load_manifest(&dir);
+    if !manifest.is_empty() {
+        return Ok(manifest);
+    }
+
+    // 2. Scan file gambar manual di folder jika manifest belum ada
+    let mut map = HashMap::new();
+    let extensions = ["png", "webp", "jpg", "jpeg", "svg"];
+
+    for &frame in FRAME_NAMES {
+        for &ext in &extensions {
+            let candidate = dir.join(format!("{}.{}", frame, ext));
+            if candidate.exists() {
+                if let Ok(bytes) = fs::read(&candidate) {
+                    let mime = match ext {
+                        "webp" => "image/webp",
+                        "jpg" | "jpeg" => "image/jpeg",
+                        "svg" => "image/svg+xml",
+                        _ => "image/png",
+                    };
+                    let b64 = BASE64_STANDARD.encode(&bytes);
+                    let data_url = format!("data:{};base64,{}", mime, b64);
+                    map.insert(frame.to_string(), data_url);
+                    break;
+                }
+            }
+        }
+    }
+
+    Ok(map)
+}
+
+/// Reset kustomisasi avatar ke SVG Anime bawaan
+pub fn reset_avatar_pack() -> Result<(), String> {
+    let dir = get_avatar_dir();
+    let manifest_path = dir.join("manifest.json");
+    if manifest_path.exists() {
+        let _ = fs::remove_file(manifest_path);
+    }
+
+    // Hapus semua file frame di folder avatar
+    if dir.exists() {
+        if let Ok(entries) = fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.is_file() {
+                    let _ = fs::remove_file(p);
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn load_manifest(dir: &Path) -> HashMap<String, String> {
+    let path = dir.join("manifest.json");
+    if path.exists() {
+        if let Ok(content) = fs::read_to_string(&path) {
+            if let Ok(map) = serde_json::from_str::<HashMap<String, String>>(&content) {
+                return map;
+            }
+        }
+    }
+    HashMap::new()
+}
+
+fn save_manifest(dir: &Path, map: &HashMap<String, String>) -> Result<(), String> {
+    let path = dir.join("manifest.json");
+    let json_str = serde_json::to_string_pretty(map)
+        .map_err(|e| format!("Gagal serialisasi manifest: {}", e))?;
+    fs::write(&path, json_str)
+        .map_err(|e| format!("Gagal menulis manifest: {}", e))?;
+    Ok(())
+}
+
+==> src-tauri/src/bash_executor.rs <==
+// src-tauri/src/bash_executor.rs
+// Two-Tier Command Execution System
+//
+// ┌─────────────────────────────────────────────────────────────────────┐
+// │  GREEN TIER  → Aman, langsung dieksekusi tanpa konfirmasi           │
+// │  RED TIER    → Destruktif/berbahaya, wajib konfirmasi Alt+Y/Alt+N  │
+// └─────────────────────────────────────────────────────────────────────┘
+//
+// Regex classifier memfilter kata kunci berbahaya SEBELUM menyentuh shell.
+// Semua eksekusi menggunakan `sh -c` dengan timeout 30 detik.
+
+use std::process::Stdio;
+use tokio::process::Command;
+use tokio::time::{timeout, Duration};
+
+// ────────────────────────────────────────────────────────────────────────────
+// Classifier: Tentukan tier dari sebuah perintah
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Kembalikan `true` jika perintah termasuk Red Tier (butuh konfirmasi)
+pub fn is_red_tier(command: &str) -> bool {
+    // Kata kunci yang wajib memicu konfirmasi pengguna
+    let red_patterns = [
+        r"sudo\b",
+        r"\brm\b",
+        r"\bmv\b",
+        r"\bdd\b",
+        r"\bmkfs\b",
+        r"\bformat\b",
+        r"\bfdisk\b",
+        r"\bparted\b",
+        r"\bshred\b",
+        r"\bpacman\b",
+        r"\bparu\b",
+        r"\byay\b",
+        r"\bsystemctl\b",
+        r"\bjournalctl\b",
+        r"\bkill\b",
+        r"\bpkill\b",
+        r"\bkillall\b",
+        r"\bchmod\b",
+        r"\bchown\b",
+        r"\bchattr\b",
+        r"\biptables\b",
+        r"\bufw\b",
+        r"\bcurl\b.*\|\s*bash",   // curl | bash — sangat berbahaya
+        r"\bwget\b.*\|\s*sh",     // wget | sh
+        r">\s*/dev/",             // redirect ke /dev/
+        r">\s*/etc/",             // overwrite config sistem
+        r">\s*/boot/",
+        r">\s*/usr/",
+        r"\btruncate\b",
+        r"--no-preserve-root",
+    ];
+
+    for pattern in &red_patterns {
+        if let Ok(re) = regex_lite(pattern, command) {
+            if re {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Cek apakah `command` mengandung pattern (manual regex-lite tanpa dep regex)
+fn regex_lite(pattern: &str, text: &str) -> Result<bool, ()> {
+    // Implementasi sederhana: strip \b dan cek kata
+    // Untuk production, tambahkan crate `regex` ke Cargo.toml
+    let core = pattern
+        .trim_start_matches(r"\b")
+        .trim_end_matches(r"\b")
+        .replace(r"\b", " ")
+        .replace(r"\s*", " ")
+        .replace(r".*", "");
+
+    // Handle pattern yang mengandung | (pipe patterns)
+    if pattern.contains(r"\|") {
+        // curl | bash, wget | sh — cek substring kombinasi
+        if text.contains("curl") && text.contains("bash") { return Ok(true); }
+        if text.contains("wget") && text.contains("sh") { return Ok(true); }
+        return Ok(false);
+    }
+
+    // Handle redirect patterns
+    if pattern.starts_with('>') {
+        let target = core.trim_start_matches("> /").trim_start_matches(">/");
+        return Ok(text.contains(&format!("/{}", target)) || text.contains(&format!("> /{}", target)));
+    }
+
+    // Cek apakah kata kunci muncul sebagai kata penuh (dikelilingi spasi/awal/akhir)
+    let word = core.trim();
+    let found = text.split_whitespace().any(|w| {
+        let w = w.trim_matches(|c: char| !c.is_alphanumeric() && c != '-' && c != '_');
+        w == word
+    }) || text.contains(&format!(" {} ", word))
+        || text.starts_with(&format!("{} ", word))
+        || text == word;
+
+    Ok(found)
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Parser: Ekstrak BASH:<command> dari output LLM
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Cek apakah LLM response mengandung tool call BASH:<command>
+/// Format: "...teks...\nBASH:ls -la /home\n...teks..."
+pub fn extract_bash_command(llm_response: &str) -> Option<String> {
+    for line in llm_response.lines() {
+        let line = line.trim();
+        if line.starts_with("BASH:") {
+            let cmd = line.trim_start_matches("BASH:").trim().to_string();
+            if !cmd.is_empty() {
+                return Some(cmd);
+            }
+        }
+    }
+    None
+}
+
+/// Pisahkan teks biasa dari bagian BASH: di output LLM
+pub fn strip_bash_command(llm_response: &str) -> String {
+    llm_response
+        .lines()
+        .filter(|l| !l.trim().starts_with("BASH:"))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Eksekutor
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Eksekusi perintah Green Tier langsung (tanpa konfirmasi).
+/// Timeout: 30 detik. Output di-capture dan dikembalikan.
+pub async fn execute_green(command: &str) -> Result<String, String> {
+    let result = timeout(
+        Duration::from_secs(30),
+        Command::new("sh")
+            .arg("-c")
+            .arg(command)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output(),
+    )
+    .await;
+
+    match result {
+        Ok(Ok(output)) => {
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+            if output.status.success() {
+                Ok(if stdout.is_empty() { "✅ Selesai (tidak ada output).".into() } else { stdout })
+            } else {
+                Err(if stderr.is_empty() {
+                    format!("Perintah gagal dengan exit code: {:?}", output.status.code())
+                } else {
+                    stderr
+                })
+            }
+        }
+        Ok(Err(e)) => Err(format!("Gagal menjalankan proses: {}", e)),
+        Err(_) => Err("Timeout: perintah berjalan lebih dari 30 detik.".into()),
+    }
+}
+
+/// Hasil klasifikasi perintah LLM — dipakai oleh `commands.rs`
+#[derive(Debug, serde::Serialize)]
+pub struct CommandClassification {
+    pub command: String,
+    pub tier: CommandTier,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub enum CommandTier {
+    Green,
+    Red,
+}
+
+/// Klasifikasi perintah dan kembalikan tier-nya
+pub fn classify(command: &str) -> CommandClassification {
+    CommandClassification {
+        command: command.to_string(),
+        tier: if is_red_tier(command) {
+            CommandTier::Red
+        } else {
+            CommandTier::Green
+        },
+    }
+}
+
+==> src-tauri/src/commands.rs <==
+// src-tauri/src/commands.rs
+// Semua Tauri commands yang bisa di-invoke dari Vue frontend via `invoke(...)`.
+//
+// Commands:
+//   get_current_state    → ambil snapshot state saat ini
+//   set_manual_state     → paksa ubah state (untuk testing/dev toolbar)
+//   toggle_minimize      → toggle minimize avatar
+//   ask_llm              → kirim pesan user ke LLM, tangani tool calls, update state, trigger TTS
+//   get_hyprland_context → ambil konteks desktop aktif (window + clipboard)
+//   execute_command      → eksekusi Green Tier command dari frontend
+//   speak_text           → memicu engine TTS lokal secara langsung
+//   get_config           → baca konfigurasi (~/.config/aoi/config.json)
+//   save_config          → simpan konfigurasi (~/.config/aoi/config.json)
+
+use std::sync::Arc;
+use tokio::sync::Mutex;
+use tauri::{AppHandle, State};
+
+use crate::state::{AppState, AssistantState, StatePayload};
+use crate::broadcast_state;
+use crate::llm_client::{self, LlmConfig};
+use crate::hyprland;
+use crate::bash_executor;
+use crate::tts::{self, TtsPlayerState};
+use crate::config::{self, AppConfig};
+
+// ────────────────────────────────────────────────────────────────────────────
+// State Commands
+// ────────────────────────────────────────────────────────────────────────────
+
+#[tauri::command]
+pub async fn get_current_state(state: State<'_, AppState>) -> Result<StatePayload, String> {
+    Ok(state.0.lock().await.clone())
+}
+
+#[tauri::command]
+pub async fn set_manual_state(
+    new_state: AssistantState,
+    message: String,
+    command: Option<String>,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    {
+        let mut s = state.0.lock().await;
+        s.state = new_state;
+        s.message = message;
+        s.pending_command = command;
+    }
+    broadcast_state(&app, &state.0).await;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn toggle_minimize(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    {
+        let mut s = state.0.lock().await;
+        s.minimized = !s.minimized;
+    }
+    broadcast_state(&app, &state.0).await;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn trigger_mic(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    tts_state: State<'_, TtsPlayerState>,
+    audio_recorder: State<'_, crate::stt::AudioRecorderState>,
+) -> Result<(), String> {
+    crate::socket::handle_smart_toggle(&app, &state.0, &tts_state.0, &audio_recorder.0).await;
+    Ok(())
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Config Commands
+// ────────────────────────────────────────────────────────────────────────────
+
+#[tauri::command]
+pub async fn get_config() -> Result<AppConfig, String> {
+    Ok(config::load_config())
+}
+
+#[tauri::command]
+pub async fn save_config(cfg: AppConfig) -> Result<(), String> {
+    config::save_config(&cfg)
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Avatar Sprite Commands
+// ────────────────────────────────────────────────────────────────────────────
+
+#[tauri::command]
+pub async fn save_avatar_sprite(frame_name: String, data_url: String) -> Result<String, String> {
+    crate::avatar::save_avatar_sprite(&frame_name, &data_url)
+}
+
+#[tauri::command]
+pub async fn save_avatar_pack(pack: std::collections::HashMap<String, String>) -> Result<(), String> {
+    crate::avatar::save_avatar_pack(pack)
+}
+
+#[tauri::command]
+pub async fn load_avatar_pack(folder_override: Option<String>) -> Result<std::collections::HashMap<String, String>, String> {
+    crate::avatar::load_avatar_pack(folder_override)
+}
+
+#[tauri::command]
+pub async fn reset_avatar_pack() -> Result<(), String> {
+    crate::avatar::reset_avatar_pack()
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// LLM Pipeline — shared antara chat input dan input suara STT
+// ────────────────────────────────────────────────────────────────────────────
+
+pub async fn run_ai_pipeline(
+    user_message: String,
+    app: AppHandle,
+    state_arc: Arc<Mutex<StatePayload>>,
+    tts_arc: Arc<Mutex<Option<tokio::process::Child>>>,
+) -> Result<String, String> {
+    // ── 1. Transisi ke Thinking
+    {
+        let mut s = state_arc.lock().await;
+        s.state = AssistantState::Thinking;
+        s.message = "Sedang memikirkan jawaban...".into();
+    }
+    broadcast_state(&app, &state_arc).await;
+
+    // ── 2. Kumpulkan konteks Hyprland (window aktif & clipboard)
+    let ctx = hyprland::build_context(false).await;
+    let context_str = hyprland::format_context_for_prompt(&ctx);
+
+    // ── 3. Bangun pesan dengan konteks desktop
+    let enriched_message = if context_str.trim().is_empty() {
+        user_message.clone()
+    } else {
+        format!("{}\n\n{}", user_message, context_str)
+    };
+
+    // ── 4. Konfigurasi LLM dari file config / env
+    let config = build_llm_config();
+
+    let history = vec![llm_client::ChatMessage {
+        role: "user".into(),
+        content: enriched_message,
+    }];
+
+    // ── 5. Panggil LLM provider
+    let llm_result = llm_client::chat(&config, &history).await;
+
+    match llm_result {
+        Err(e) => {
+            let mut s = state_arc.lock().await;
+            s.state = AssistantState::Error;
+            s.message = format!("❌ Error LLM: {}", e);
+            drop(s);
+            broadcast_state(&app, &state_arc).await;
+            Err(e)
+        }
+        Ok(response) => {
+            // ── 6. Cek tool call BASH:<perintah>
+            let bash_cmd = bash_executor::extract_bash_command(&response);
+            let text_reply = bash_executor::strip_bash_command(&response);
+
+            if let Some(cmd) = bash_cmd {
+                let classification = bash_executor::classify(&cmd);
+
+                match classification.tier {
+                    bash_executor::CommandTier::Green => {
+                        // Langsung eksekusi (Green Tier)
+                        let exec_result = bash_executor::execute_green(&cmd).await;
+                        let mut s = state_arc.lock().await;
+                        match exec_result {
+                            Ok(output) => {
+                                s.state = AssistantState::Speaking;
+                                let reply = if text_reply.is_empty() {
+                                    format!("✅ Selesai!\n```\n{}\n```", output.trim())
+                                } else {
+                                    format!("{}\n\n✅ Output:\n```\n{}\n```", text_reply, output.trim())
+                                };
+                                s.message = reply.clone();
+                                drop(s);
+                                broadcast_state(&app, &state_arc).await;
+
+                                // Trigger TTS
+                                let speech_text = if !text_reply.is_empty() {
+                                    text_reply.clone()
+                                } else {
+                                    "Perintah berhasil dieksekusi.".to_string()
+                                };
+                                let app_h = app.clone();
+                                let s_clone = state_arc.clone();
+                                let t_clone = tts_arc.clone();
+                                tokio::spawn(async move {
+                                    tts::speak(speech_text, app_h, s_clone, t_clone).await;
+                                });
+
+                                Ok(reply)
+                            }
+                            Err(e) => {
+                                s.state = AssistantState::Error;
+                                s.message = format!("❌ Gagal: {}", e);
+                                drop(s);
+                                broadcast_state(&app, &state_arc).await;
+                                Err(e)
+                            }
+                        }
+                    }
+                    bash_executor::CommandTier::Red => {
+                        // Butuh konfirmasi (Red Tier)
+                        let mut s = state_arc.lock().await;
+                        s.state = AssistantState::Confirm;
+                        s.pending_command = Some(cmd.clone());
+                        s.message = if text_reply.is_empty() {
+                            format!("Izinkan saya menjalankan perintah ini?")
+                        } else {
+                            text_reply.clone()
+                        };
+                        drop(s);
+                        broadcast_state(&app, &state_arc).await;
+                        Ok(format!(
+                            "{}\n\n⚠️ Perintah memerlukan konfirmasi: `{}`",
+                            text_reply, cmd
+                        ))
+                    }
+                }
+            } else {
+                // ── Balasan teks biasa → Speaking + TTS + RMS Lip-Sync
+                let mut s = state_arc.lock().await;
+                s.state = AssistantState::Speaking;
+                s.message = response.clone();
+                drop(s);
+                broadcast_state(&app, &state_arc).await;
+
+                // Trigger TTS
+                let speech_text = tts::clean_text_for_tts(&response);
+                let app_h = app.clone();
+                let s_clone = state_arc.clone();
+                let t_clone = tts_arc.clone();
+                tokio::spawn(async move {
+                    tts::speak(speech_text, app_h, s_clone, t_clone).await;
+                });
+
+                Ok(response)
+            }
+        }
+    }
+}
+
+#[tauri::command]
+pub async fn ask_llm(
+    user_message: String,
+    app: AppHandle,
+    state: State<'_, AppState>,
+    tts_state: State<'_, TtsPlayerState>,
+) -> Result<String, String> {
+    run_ai_pipeline(user_message, app, state.0.clone(), tts_state.0.clone()).await
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Direct TTS Command
+// ────────────────────────────────────────────────────────────────────────────
+
+#[tauri::command]
+pub async fn speak_text(
+    text: String,
+    app: AppHandle,
+    state: State<'_, AppState>,
+    tts_state: State<'_, TtsPlayerState>,
+) -> Result<(), String> {
+    {
+        let mut s = state.0.lock().await;
+        s.state = AssistantState::Speaking;
+        s.message = text.clone();
+    }
+    broadcast_state(&app, &state.0).await;
+
+    let app_h = app.clone();
+    let state_arc = state.0.clone();
+    let tts_arc = tts_state.0.clone();
+    tokio::spawn(async move {
+        tts::speak(text, app_h, state_arc, tts_arc).await;
+    });
+
+    Ok(())
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Hyprland Context Command
+// ────────────────────────────────────────────────────────────────────────────
+
+#[tauri::command]
+pub async fn get_hyprland_context() -> Result<hyprland::HyprlandContext, String> {
+    Ok(hyprland::build_context(false).await)
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Direct Execute Command (dari UI)
+// ────────────────────────────────────────────────────────────────────────────
+
+#[tauri::command]
+pub async fn execute_command(
+    command: String,
+    app: AppHandle,
+    state: State<'_, AppState>,
+    tts_state: State<'_, TtsPlayerState>,
+) -> Result<String, String> {
+    if bash_executor::is_red_tier(&command) {
+        return Err("Perintah ini memerlukan konfirmasi via keybind Alt+Y".into());
+    }
+
+    let result = bash_executor::execute_green(&command).await?;
+
+    {
+        let mut s = state.0.lock().await;
+        s.state = AssistantState::Speaking;
+        s.message = format!("✅ Output:\n{}", result.trim());
+    }
+    broadcast_state(&app, &state.0).await;
+
+    let app_h = app.clone();
+    let state_arc = state.0.clone();
+    let tts_arc = tts_state.0.clone();
+    tokio::spawn(async move {
+        tts::speak("Perintah selesai dijalankan.".into(), app_h, state_arc, tts_arc).await;
+    });
+
+    Ok(result)
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Helper: Membangun LlmConfig dari config.json + env fallback
+// ────────────────────────────────────────────────────────────────────────────
+
+pub fn build_llm_config() -> LlmConfig {
+    let cfg = config::load_config();
+    let p_lower = cfg.llm_provider.to_lowercase();
+
+    let provider = match p_lower.as_str() {
+        "openai" | "groq" | "openrouter" | "custom" => llm_client::LlmProvider::OpenAI,
+        "ollama" => llm_client::LlmProvider::Ollama,
+        _ => llm_client::LlmProvider::Gemini,
+    };
+
+    let api_key = match provider {
+        llm_client::LlmProvider::Gemini => {
+            if !cfg.gemini_api_key.is_empty() {
+                Some(cfg.gemini_api_key.clone())
+            } else {
+                std::env::var("GEMINI_API_KEY").ok()
+            }
+        }
+        llm_client::LlmProvider::OpenAI => {
+            if p_lower == "custom" {
+                if !cfg.custom_api_key.is_empty() {
+                    Some(cfg.custom_api_key.clone())
+                } else {
+                    std::env::var("AOI_CUSTOM_API_KEY").ok()
+                }
+            } else if p_lower == "groq" && !cfg.groq_api_key.is_empty() {
+                Some(cfg.groq_api_key.clone())
+            } else if p_lower == "openrouter" && !cfg.openrouter_api_key.is_empty() {
+                Some(cfg.openrouter_api_key.clone())
+            } else if !cfg.openai_api_key.is_empty() {
+                Some(cfg.openai_api_key.clone())
+            } else {
+                std::env::var("OPENAI_API_KEY")
+                    .or_else(|_| std::env::var("GROQ_API_KEY"))
+                    .or_else(|_| std::env::var("OPENROUTER_API_KEY"))
+                    .ok()
+            }
+        }
+        llm_client::LlmProvider::Ollama => None,
+    };
+
+    let base_url = if p_lower == "custom" {
+        if !cfg.custom_api_endpoint.is_empty() {
+            Some(cfg.custom_api_endpoint.clone())
+        } else {
+            std::env::var("AOI_CUSTOM_ENDPOINT").ok()
+        }
+    } else if p_lower == "groq" {
+        Some("https://api.groq.com/openai/v1".into())
+    } else if p_lower == "openrouter" {
+        Some("https://openrouter.ai/api/v1".into())
+    } else if provider == llm_client::LlmProvider::Ollama {
+        Some(cfg.ollama_base_url.clone())
+    } else {
+        std::env::var("AOI_BASE_URL").ok()
+    };
+
+    let model = if !cfg.model_name.is_empty() {
+        cfg.model_name
+    } else {
+        match provider {
+            llm_client::LlmProvider::Gemini => "gemini-2.0-flash".into(),
+            llm_client::LlmProvider::OpenAI => {
+                if p_lower == "groq" {
+                    "llama-3.3-70b-versatile".into()
+                } else if p_lower == "custom" {
+                    "default".into()
+                } else {
+                    "gpt-4o-mini".into()
+                }
+            }
+            llm_client::LlmProvider::Ollama => "llama3.2".into(),
+        }
+    };
+
+    LlmConfig {
+        provider,
+        api_key,
+        base_url,
+        model,
+        system_prompt: concat!(
+            "Kamu adalah Aoi, asisten AI desktop pendamping bergaya anime yang ringan dan cerdas, ",
+            "berjalan di CachyOS (Arch Linux) dengan Hyprland Wayland compositor. ",
+            "Kamu membantu pengguna dengan tugas sehari-hari, coding, troubleshooting sistem Linux, ",
+            "dan administrasi Arch Linux. Jawab dengan ramah, ringkas, dan teknis jika diperlukan. ",
+            "Jika kamu perlu menjalankan perintah shell untuk membantu user, tuliskan di baris terpisah ",
+            "dengan format tepat: BASH:<perintah>\n",
+            "Contoh: BASH:ls -la ~/\n",
+            "Jangan pernah menambahkan penjelasan di dalam tag BASH, hanya perintahnya saja."
+        ).into(),
+    }
+}
+
+==> src-tauri/src/config.rs <==
+// src-tauri/src/config.rs
+// Manajemen konfigurasi persistent (~/.config/aoi/config.json)
+// Mengatur API key, provider LLM, path model TTS & Whisper, serta folder avatar.
+
+use std::fs;
+use std::path::PathBuf;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppConfig {
+    pub llm_provider: String,         // "gemini", "groq", "openai", "openrouter", "ollama", "custom"
+    pub gemini_api_key: String,
+    pub groq_api_key: String,
+    pub openai_api_key: String,
+    pub openrouter_api_key: String,
+    pub ollama_base_url: String,
+
+    #[serde(default)]
+    pub custom_api_key: String,
+    #[serde(default)]
+    pub custom_api_endpoint: String,  // e.g. "https://api.deepseek.com/v1" atau "http://localhost:8000/v1"
+
+    pub model_name: String,
+    pub tts_model_path: String,
+    pub whisper_model_path: String,
+    pub avatar_folder_path: String,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            llm_provider: std::env::var("AOI_LLM_PROVIDER").unwrap_or_else(|_| "gemini".into()),
+            gemini_api_key: std::env::var("GEMINI_API_KEY").unwrap_or_default(),
+            groq_api_key: std::env::var("GROQ_API_KEY").unwrap_or_default(),
+            openai_api_key: std::env::var("OPENAI_API_KEY").unwrap_or_default(),
+            openrouter_api_key: std::env::var("OPENROUTER_API_KEY").unwrap_or_default(),
+            ollama_base_url: std::env::var("AOI_BASE_URL").unwrap_or_else(|_| "http://localhost:11434".into()),
+            custom_api_key: std::env::var("AOI_CUSTOM_API_KEY").unwrap_or_default(),
+            custom_api_endpoint: std::env::var("AOI_CUSTOM_ENDPOINT").unwrap_or_default(),
+            model_name: std::env::var("AOI_MODEL").unwrap_or_else(|_| "gemini-2.0-flash".into()),
+            tts_model_path: std::env::var("AOI_TTS_MODEL").unwrap_or_default(),
+            whisper_model_path: std::env::var("AOI_WHISPER_MODEL").unwrap_or_default(),
+            avatar_folder_path: String::new(),
+        }
+    }
+}
+
+pub fn get_config_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    PathBuf::from(home).join(".config/aoi/config.json")
+}
+
+pub fn load_config() -> AppConfig {
+    let path = get_config_path();
+    if path.exists() {
+        if let Ok(content) = fs::read_to_string(&path) {
+            if let Ok(cfg) = serde_json::from_str::<AppConfig>(&content) {
+                return cfg;
+            }
+        }
+    }
+    let default = AppConfig::default();
+    let _ = save_config(&default);
+    default
+}
+
+pub fn save_config(config: &AppConfig) -> Result<(), String> {
+    let path = get_config_path();
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let json_str = serde_json::to_string_pretty(config)
+        .map_err(|e| format!("Gagal serialisasi config: {}", e))?;
+    fs::write(&path, json_str)
+        .map_err(|e| format!("Gagal menulis ke {:?}: {}", path, e))?;
+    Ok(())
+}
+
+==> src-tauri/src/hyprland.rs <==
+// src-tauri/src/hyprland.rs
+// Modul konteks Hyprland & Vision — membaca lingkungan desktop aktif pengguna
+// untuk dikirim sebagai konteks tambahan ke LLM.
+//
+// Fungsi:
+//   - get_active_window()  → hyprctl activewindow -j
+//   - get_clipboard()      → wl-paste
+//   - take_screenshot()    → grim -g <geometry> /tmp/aoi_screenshot.png
+//   - build_context()      → gabung semua jadi string konteks untuk LLM prompt
+
+use std::process::Stdio;
+use tokio::process::Command;
+
+/// Data jendela aktif dari hyprctl
+#[derive(Debug, serde::Deserialize, serde::Serialize, Clone)]
+pub struct ActiveWindow {
+    pub class: String,
+    pub title: String,
+    pub pid: i64,
+    pub workspace: Option<WorkspaceInfo>,
+}
+
+#[derive(Debug, serde::Deserialize, serde::Serialize, Clone)]
+pub struct WorkspaceInfo {
+    pub id: i64,
+    pub name: String,
+}
+
+/// Konteks lengkap lingkungan desktop yang dikumpulkan sebelum call LLM
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct HyprlandContext {
+    pub active_window_class: String,
+    pub active_window_title: String,
+    pub clipboard_text: Option<String>,
+    pub screenshot_path: Option<String>,
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Fungsi publik
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Baca jendela aktif Hyprland via `hyprctl activewindow -j`
+pub async fn get_active_window() -> Option<ActiveWindow> {
+    let output = Command::new("hyprctl")
+        .args(["activewindow", "-j"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .await
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    serde_json::from_slice(&output.stdout).ok()
+}
+
+/// Baca isi clipboard saat ini via `wl-paste` (wl-clipboard package)
+pub async fn get_clipboard() -> Option<String> {
+    let output = Command::new("wl-paste")
+        .arg("--no-newline")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .await
+        .ok()?;
+
+    if !output.status.success() || output.stdout.is_empty() {
+        return None;
+    }
+
+    String::from_utf8(output.stdout).ok().map(|s| {
+        // Batasi clipboard ke 2000 karakter agar tidak membloat prompt LLM
+        if s.len() > 2000 {
+            format!("{}... [dipotong]", &s[..2000])
+        } else {
+            s
+        }
+    })
+}
+
+/// Ambil screenshot seluruh layar pertama via `grim`, simpan ke /tmp/aoi_screenshot.png
+/// Tahap 3: akan dikirim ke LLM vision model (Gemini Pro Vision)
+pub async fn take_screenshot() -> Option<String> {
+    let path = "/tmp/aoi_screenshot.png";
+
+    let status = Command::new("grim")
+        .arg(path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .ok()?;
+
+    if status.success() {
+        Some(path.to_string())
+    } else {
+        None
+    }
+}
+
+/// Kumpulkan semua konteks dan format menjadi string siap inject ke prompt LLM.
+/// `include_screenshot` hanya aktif jika user secara eksplisit meminta vision.
+pub async fn build_context(include_screenshot: bool) -> HyprlandContext {
+    let window = get_active_window().await;
+    let clipboard = get_clipboard().await;
+    let screenshot = if include_screenshot {
+        take_screenshot().await
+    } else {
+        None
+    };
+
+    HyprlandContext {
+        active_window_class: window
+            .as_ref()
+            .map(|w| w.class.clone())
+            .unwrap_or_else(|| "unknown".into()),
+        active_window_title: window
+            .as_ref()
+            .map(|w| w.title.clone())
+            .unwrap_or_else(|| "unknown".into()),
+        clipboard_text: clipboard,
+        screenshot_path: screenshot,
+    }
+}
+
+/// Format context menjadi blok teks untuk disisipi ke system/user prompt LLM
+pub fn format_context_for_prompt(ctx: &HyprlandContext) -> String {
+    let mut parts = Vec::new();
+
+    parts.push(format!(
+        "[Konteks Desktop]\n- Jendela aktif: {} ({})",
+        ctx.active_window_title, ctx.active_window_class
+    ));
+
+    if let Some(ref clip) = ctx.clipboard_text {
+        if !clip.trim().is_empty() {
+            parts.push(format!("- Clipboard:\n```\n{}\n```", clip));
+        }
+    }
+
+    if ctx.screenshot_path.is_some() {
+        parts.push("- Screenshot layar sudah diambil dan siap dianalisis.".into());
+    }
+
+    parts.join("\n")
+}
+
+==> src-tauri/src/lib.rs <==
+// src-tauri/src/lib.rs
+// Entry point library — mengorkestrasi semua modul Aoi AI Assistant.
+
+mod state;
+mod socket;
+mod llm_client;
+mod hyprland;
+mod bash_executor;
+mod commands;
+mod tts;
+pub mod config;
+pub mod stt;
+pub mod avatar;
+
+use std::sync::Arc;
+use tokio::sync::Mutex;
+use tauri::{AppHandle, Emitter};
+
+pub use state::{AppState, AssistantState, StatePayload};
+pub use tts::TtsPlayerState;
+pub use stt::AudioRecorderState;
+
+// ────────────────────────────────────────────────────────────────────────────
+// Broadcast: sinkronisasi state ke Vue UI + /tmp/ai_state.json (Ryoku bar)
+// ────────────────────────────────────────────────────────────────────────────
+
+pub async fn broadcast_state(app: &AppHandle, shared: &Arc<Mutex<StatePayload>>) {
+    let current = shared.lock().await.clone();
+    let _ = app.emit("assistant-state-changed", &current);
+    if let Ok(json) = serde_json::to_string(&current) {
+        let _ = tokio::fs::write("/tmp/ai_state.json", json).await;
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Tauri Entry Point
+// ────────────────────────────────────────────────────────────────────────────
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    let initial_state = Arc::new(Mutex::new(StatePayload {
+        state: AssistantState::Idle,
+        message: "Halo! Tekan Super+V atau ketik untuk mulai ngobrol.".into(),
+        pending_command: None,
+        minimized: false,
+    }));
+
+    // Handle proses TTS audio player
+    let tts_player: Arc<Mutex<Option<tokio::process::Child>>> =
+        Arc::new(Mutex::new(None));
+
+    // Handle proses perekaman mikrofon PipeWire
+    let audio_recorder: Arc<Mutex<Option<tokio::process::Child>>> =
+        Arc::new(Mutex::new(None));
+
+    tauri::Builder::default()
+        .manage(AppState(initial_state.clone()))
+        .manage(TtsPlayerState(tts_player.clone()))
+        .manage(AudioRecorderState(audio_recorder.clone()))
+        .setup(move |app| {
+            let handle = app.handle().clone();
+            let state_clone = initial_state.clone();
+            let tts_clone = tts_player.clone();
+            let rec_clone = audio_recorder.clone();
+
+            tauri::async_runtime::spawn(async move {
+                // Broadcast state awal
+                broadcast_state(&handle, &state_clone).await;
+                // Jalankan IPC socket listener di background
+                socket::spawn_unix_socket_listener(handle, state_clone, tts_clone, rec_clone).await;
+            });
+
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![
+            commands::get_current_state,
+            commands::set_manual_state,
+            commands::toggle_minimize,
+            commands::ask_llm,
+            commands::get_hyprland_context,
+            commands::execute_command,
+            commands::speak_text,
+            commands::get_config,
+            commands::save_config,
+            commands::trigger_mic,
+            commands::save_avatar_sprite,
+            commands::save_avatar_pack,
+            commands::load_avatar_pack,
+            commands::reset_avatar_pack,
+        ])
+        .run(tauri::generate_context!())
+        .expect("error saat menjalankan Aoi AI Assistant");
+}
+
+==> src-tauri/src/llm_client.rs <==
+// src-tauri/src/llm_client.rs
+// Multi-provider LLM client — agnostik untuk Gemini, OpenAI-compatible (Groq/OpenRouter), dan Ollama.
+//
+// Cara kerja:
+//   1. Baca konfigurasi provider dari env atau config file (~/.config/aoi/config.json)
+//   2. Bangun request payload sesuai format masing-masing provider
+//   3. Streaming response via reqwest, kumpulkan teks, kembalikan sebagai String
+//
+// Memory: conversation history disimpan in-memory (Vec<ChatMessage>), max 20 pesan terakhir.
+
+use serde::{Deserialize, Serialize};
+use std::env;
+
+// ────────────────────────────────────────────────────────────────────────────
+// Tipe Data
+// ────────────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatMessage {
+    pub role: String,   // "user" | "assistant" | "system"
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LlmConfig {
+    pub provider: LlmProvider,
+    pub api_key: Option<String>,
+    pub base_url: Option<String>, // override untuk OpenRouter / Ollama lokal
+    pub model: String,
+    pub system_prompt: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum LlmProvider {
+    Gemini,
+    OpenAI,   // juga berlaku untuk Groq & OpenRouter (format sama)
+    Ollama,
+}
+
+impl Default for LlmConfig {
+    fn default() -> Self {
+        Self {
+            provider: LlmProvider::Gemini,
+            api_key: env::var("GEMINI_API_KEY").ok(),
+            base_url: None,
+            model: "gemini-2.0-flash".into(),
+            system_prompt: concat!(
+                "Kamu adalah Aoi, asisten AI desktop pendamping bergaya anime yang ringan dan cerdas, ",
+                "berjalan di CachyOS (Arch Linux) dengan Hyprland Wayland compositor. ",
+                "Kamu membantu pengguna dengan tugas sehari-hari, coding, troubleshooting sistem Linux, ",
+                "dan administrasi Arch Linux. Jawab dengan ramah, ringkas, dan teknis jika diperlukan. ",
+                "Jika kamu perlu menjalankan perintah shell, gunakan format tool_call: BASH:<perintah>"
+            ).into(),
+        }
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Shared HTTP client (lazy-init via std::sync::OnceLock)
+// ────────────────────────────────────────────────────────────────────────────
+
+fn http_client() -> &'static reqwest::Client {
+    use std::sync::OnceLock;
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(60))
+            .build()
+            .expect("Gagal membuat HTTP client")
+    })
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Entry point utama
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Kirim conversation history ke provider yang aktif, kembalikan balasan teks asisten.
+pub async fn chat(
+    config: &LlmConfig,
+    history: &[ChatMessage],
+) -> Result<String, String> {
+    match config.provider {
+        LlmProvider::Gemini => gemini_chat(config, history).await,
+        LlmProvider::OpenAI => openai_chat(config, history).await,
+        LlmProvider::Ollama => ollama_chat(config, history).await,
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Provider: Google Gemini (generateContent REST API)
+// ────────────────────────────────────────────────────────────────────────────
+
+async fn gemini_chat(config: &LlmConfig, history: &[ChatMessage]) -> Result<String, String> {
+    let api_key = config
+        .api_key
+        .as_deref()
+        .ok_or("GEMINI_API_KEY tidak ditemukan")?;
+
+    let model = &config.model;
+    let url = format!(
+        "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
+        model, api_key
+    );
+
+    // Konversi history ke format Gemini (contents[])
+    // System prompt masuk sebagai "user" turn pertama di Gemini
+    let contents: Vec<serde_json::Value> = Vec::new();
+
+    // Sisipkan system prompt sebagai instruksi model (Gemini v1beta mendukung systemInstruction)
+    let body = serde_json::json!({
+        "systemInstruction": {
+            "parts": [{ "text": config.system_prompt }]
+        },
+        "contents": history.iter().map(|m| serde_json::json!({
+            "role": if m.role == "assistant" { "model" } else { "user" },
+            "parts": [{ "text": m.content }]
+        })).collect::<Vec<_>>(),
+        "generationConfig": {
+            "temperature": 0.7,
+            "maxOutputTokens": 1024,
+        }
+    });
+    // Pastikan tidak ada warning unused
+    drop(contents);
+
+    let resp = http_client()
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("HTTP error Gemini: {}", e))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(format!("Gemini API error {}: {}", status, text));
+    }
+
+    let json: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+
+    let text = json["candidates"][0]["content"]["parts"][0]["text"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+
+    if text.is_empty() {
+        Err("Gemini mengembalikan respons kosong".into())
+    } else {
+        Ok(text)
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Provider: OpenAI-compatible (OpenAI / Groq / OpenRouter — format identik)
+// ────────────────────────────────────────────────────────────────────────────
+
+async fn openai_chat(config: &LlmConfig, history: &[ChatMessage]) -> Result<String, String> {
+    let raw_base = config
+        .base_url
+        .as_deref()
+        .unwrap_or("https://api.openai.com/v1")
+        .trim()
+        .trim_end_matches('/');
+
+    let url = if raw_base.ends_with("/chat/completions") {
+        raw_base.to_string()
+    } else {
+        format!("{}/chat/completions", raw_base)
+    };
+
+    // Sisipkan system message di awal
+    let mut messages = vec![serde_json::json!({
+        "role": "system",
+        "content": config.system_prompt
+    })];
+    for m in history {
+        messages.push(serde_json::json!({
+            "role": m.role,
+            "content": m.content
+        }));
+    }
+
+    let body = serde_json::json!({
+        "model": config.model,
+        "messages": messages,
+        "temperature": 0.7,
+        "max_tokens": 1024,
+    });
+
+    let mut req = http_client().post(&url);
+
+    // Kirim bearer auth jika API key tersedia dan tidak kosong
+    if let Some(key) = config.api_key.as_deref() {
+        if !key.trim().is_empty() {
+            req = req.bearer_auth(key.trim());
+        }
+    }
+
+    let resp = req
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("HTTP error ({}): {}", url, e))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(format!("OpenAI API error {}: {}", status, text));
+    }
+
+    let json: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+    let text = json["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+
+    if text.is_empty() {
+        Err("Provider mengembalikan respons kosong".into())
+    } else {
+        Ok(text)
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Provider: Ollama (lokal, tanpa API key)
+// ────────────────────────────────────────────────────────────────────────────
+
+async fn ollama_chat(config: &LlmConfig, history: &[ChatMessage]) -> Result<String, String> {
+    let base_url = config
+        .base_url
+        .as_deref()
+        .unwrap_or("http://localhost:11434");
+
+    let url = format!("{}/api/chat", base_url);
+
+    // Sisipkan system message
+    let mut messages = vec![serde_json::json!({
+        "role": "system",
+        "content": config.system_prompt
+    })];
+    for m in history {
+        messages.push(serde_json::json!({
+            "role": m.role,
+            "content": m.content
+        }));
+    }
+
+    let body = serde_json::json!({
+        "model": config.model,
+        "messages": messages,
+        "stream": false,
+        "options": {
+            "temperature": 0.7,
+            "num_predict": 1024,
+        }
+    });
+
+    let resp = http_client()
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("HTTP error Ollama: {}", e))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(format!("Ollama error {}: {}", status, text));
+    }
+
+    let json: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+    let text = json["message"]["content"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+
+    if text.is_empty() {
+        Err("Ollama mengembalikan respons kosong".into())
+    } else {
+        Ok(text)
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Short-term Memory Manager (in-RAM, max 20 pesan)
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Short-term conversation memory — dipakai penuh di Tahap 4 (persistent memory + context window)
+#[allow(dead_code)]
+pub struct ConversationMemory {
+    messages: Vec<ChatMessage>,
+    max_messages: usize,
+}
+
+#[allow(dead_code)]
+impl ConversationMemory {
+    pub fn new() -> Self {
+        Self {
+            messages: Vec::new(),
+            max_messages: 20,
+        }
+    }
+
+    pub fn push_user(&mut self, content: String) {
+        self.messages.push(ChatMessage {
+            role: "user".into(),
+            content,
+        });
+        self.trim();
+    }
+
+    pub fn push_assistant(&mut self, content: String) {
+        self.messages.push(ChatMessage {
+            role: "assistant".into(),
+            content,
+        });
+        self.trim();
+    }
+
+    pub fn messages(&self) -> &[ChatMessage] {
+        &self.messages
+    }
+
+    pub fn clear(&mut self) {
+        self.messages.clear();
+    }
+
+    fn trim(&mut self) {
+        // Hapus pesan terlama (tapi jaga selalu berpasangan user-assistant)
+        while self.messages.len() > self.max_messages {
+            self.messages.remove(0);
+        }
+    }
+}
+
+impl Default for ConversationMemory {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+==> src-tauri/src/main.rs <==
+// Prevents additional console window on Windows in release, DO NOT REMOVE!!
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+fn main() {
+    ai_hypr_assistant_lib::run()
+}
+
+==> src-tauri/src/socket.rs <==
+// src-tauri/src/socket.rs
+// Unix Domain Socket listener — menerima sinyal dari keybind Hyprland via socat.
+// Protokol:
+//   toggle_mic  (Super + V) → Mulai rekam / Selesai rekam (STT) / Barge-in
+//   toggle_hide (Super + H) → Sembunyikan / Tampilkan avatar
+//   confirm_yes (Alt + Y)   → Eksekusi Red Tier command yang tertunda
+//   confirm_no  (Alt + N)   → Batalkan perintah Red Tier
+
+use std::path::Path;
+use std::sync::Arc;
+
+use tauri::AppHandle;
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::net::UnixListener;
+use tokio::process::Child;
+use tokio::sync::Mutex;
+
+use crate::bash_executor;
+use crate::broadcast_state;
+use crate::commands;
+use crate::config;
+use crate::state::{AssistantState, StatePayload};
+use crate::stt;
+use crate::tts;
+
+const SOCKET_PATH: &str = "/tmp/ai-assistant.sock";
+
+// ────────────────────────────────────────────────────────────────────────────
+// Socket Server
+// ────────────────────────────────────────────────────────────────────────────
+
+pub async fn spawn_unix_socket_listener(
+    app: AppHandle,
+    shared: Arc<Mutex<StatePayload>>,
+    tts_player: Arc<Mutex<Option<Child>>>,
+    audio_recorder: Arc<Mutex<Option<Child>>>,
+) {
+    if Path::new(SOCKET_PATH).exists() {
+        let _ = tokio::fs::remove_file(SOCKET_PATH).await;
+    }
+
+    let listener =
+        UnixListener::bind(SOCKET_PATH).expect("Gagal bind Unix Socket /tmp/ai-assistant.sock");
+
+    println!("🚀 IPC Socket aktif di: {}", SOCKET_PATH);
+
+    loop {
+        match listener.accept().await {
+            Ok((stream, _)) => {
+                let app = app.clone();
+                let shared = shared.clone();
+                let tts_player = tts_player.clone();
+                let audio_recorder = audio_recorder.clone();
+
+                tokio::spawn(async move {
+                    let reader = BufReader::new(stream);
+                    let mut lines = reader.lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        handle_command(
+                            line.trim(),
+                            &app,
+                            &shared,
+                            &tts_player,
+                            &audio_recorder,
+                        )
+                        .await;
+                    }
+                });
+            }
+            Err(e) => eprintln!("Socket accept error: {}", e),
+        }
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Command Handler
+// ────────────────────────────────────────────────────────────────────────────
+
+async fn handle_command(
+    cmd: &str,
+    app: &AppHandle,
+    shared: &Arc<Mutex<StatePayload>>,
+    tts_player: &Arc<Mutex<Option<Child>>>,
+    audio_recorder: &Arc<Mutex<Option<Child>>>,
+) {
+    match cmd {
+        "toggle_mic" => {
+            handle_smart_toggle(app, shared, tts_player, audio_recorder).await;
+        }
+
+        "toggle_hide" => {
+            shared.lock().await.minimized ^= true;
+            broadcast_state(app, shared).await;
+        }
+
+        "confirm_yes" => {
+            let pending = {
+                let mut s = shared.lock().await;
+                if s.state == AssistantState::Confirm {
+                    let cmd = s.pending_command.take();
+                    s.state = AssistantState::Thinking;
+                    s.message = "✅ Menjalankan perintah...".into();
+                    cmd
+                } else {
+                    None
+                }
+            };
+            broadcast_state(app, shared).await;
+
+            if let Some(bash_cmd) = pending {
+                let result = bash_executor::execute_green(&bash_cmd).await;
+                let mut s = shared.lock().await;
+                match result {
+                    Ok(out) => {
+                        s.state = AssistantState::Speaking;
+                        s.message = format!("✅ Selesai:\n{}", out.trim());
+                        let app_h = app.clone();
+                        let state_arc = shared.clone();
+                        let tts_arc = tts_player.clone();
+                        tokio::spawn(async move {
+                            tts::speak(
+                                "Perintah berhasil dieksekusi.".into(),
+                                app_h,
+                                state_arc,
+                                tts_arc,
+                            )
+                            .await;
+                        });
+                    }
+                    Err(e) => {
+                        s.state = AssistantState::Error;
+                        s.message = format!("❌ Error: {}", e);
+                    }
+                }
+                drop(s);
+                broadcast_state(app, shared).await;
+            }
+        }
+
+        "confirm_no" => {
+            let mut s = shared.lock().await;
+            if s.state == AssistantState::Confirm {
+                s.state = AssistantState::Idle;
+                s.pending_command = None;
+                s.message = "❌ Perintah dibatalkan oleh pengguna.".into();
+            }
+            drop(s);
+            broadcast_state(app, shared).await;
+        }
+
+        // Testing manual state via CLI
+        _ if cmd.starts_with("state:") => {
+            let target = cmd.trim_start_matches("state:");
+            let mut s = shared.lock().await;
+            match target {
+                "idle" => {
+                    s.state = AssistantState::Idle;
+                    s.message = "Standby... Tekan Super+V untuk bicara.".into();
+                }
+                "listening" => {
+                    s.state = AssistantState::Listening;
+                    s.message = "Mendengarkan suaramu...".into();
+                }
+                "thinking" => {
+                    s.state = AssistantState::Thinking;
+                    s.message = "Sedang memikirkan jawaban...".into();
+                }
+                "speaking" => {
+                    s.state = AssistantState::Speaking;
+                    s.message = "Halo! Ada yang bisa aku bantu di CachyOS?".into();
+                }
+                "confirm" => {
+                    s.state = AssistantState::Confirm;
+                    s.message = "Izinkan saya menjalankan perintah ini?".into();
+                    s.pending_command = Some("sudo pacman -Syu".into());
+                }
+                "error" => {
+                    s.state = AssistantState::Error;
+                    s.message = "Waduh, koneksi API gagal!".into();
+                }
+                _ => {}
+            }
+            drop(s);
+            broadcast_state(app, shared).await;
+        }
+
+        _ => eprintln!("Perintah socket tidak dikenal: {}", cmd),
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Smart Keybind Handler (Super + V)
+// ────────────────────────────────────────────────────────────────────────────
+
+pub async fn handle_smart_toggle(
+    app: &AppHandle,
+    shared: &Arc<Mutex<StatePayload>>,
+    tts_player: &Arc<Mutex<Option<Child>>>,
+    audio_recorder: &Arc<Mutex<Option<Child>>>,
+) {
+    let current_state = shared.lock().await.state.clone();
+
+    match current_state {
+        // ── Dari diam / error → Mulai rekam mikrofon PipeWire
+        AssistantState::Idle | AssistantState::Error => {
+            match stt::start_recording(audio_recorder).await {
+                Ok(()) => {
+                    let mut s = shared.lock().await;
+                    s.state = AssistantState::Listening;
+                    s.message = "🎙️ Mendengarkan... (Tekan Super+V lagi untuk kirim)".into();
+                }
+                Err(e) => {
+                    let mut s = shared.lock().await;
+                    s.state = AssistantState::Error;
+                    s.message = format!("❌ Mic error: {}", e);
+                }
+            }
+            broadcast_state(app, shared).await;
+        }
+
+        // ── Dari mendengarkan → Selesai bicara, transkripsi & kirim ke LLM
+        AssistantState::Listening => {
+            // Hentikan rekaman audio
+            let record_res = stt::stop_recording(audio_recorder).await;
+
+            match record_res {
+                Ok(wav_path) => {
+                    {
+                        let mut s = shared.lock().await;
+                        s.state = AssistantState::Thinking;
+                        s.message = "🧠 Mentranskripsi suara...".into();
+                    }
+                    broadcast_state(app, shared).await;
+
+                    let app_clone = app.clone();
+                    let shared_clone = shared.clone();
+                    let tts_clone = tts_player.clone();
+
+                    tokio::spawn(async move {
+                        let cfg = config::load_config();
+                        match stt::transcribe(&wav_path, &cfg).await {
+                            Ok(user_text) => {
+                                println!("Transkripsi: {}", user_text);
+                                let _ = commands::run_ai_pipeline(
+                                    user_text,
+                                    app_clone,
+                                    shared_clone,
+                                    tts_clone,
+                                )
+                                .await;
+                            }
+                            Err(e) => {
+                                eprintln!("STT error: {}", e);
+                                let mut s = shared_clone.lock().await;
+                                s.state = AssistantState::Error;
+                                s.message = format!("❌ STT: {}", e);
+                                drop(s);
+                                broadcast_state(&app_clone, &shared_clone).await;
+                            }
+                        }
+                    });
+                }
+                Err(e) => {
+                    let mut s = shared.lock().await;
+                    s.state = AssistantState::Idle;
+                    s.message = format!("Mikrofon standby: {}", e);
+                    drop(s);
+                    broadcast_state(app, shared).await;
+                }
+            }
+        }
+
+        // ── BARGE-IN (Interupsi): Langsung hentikan TTS dan mulai rekam ulang
+        AssistantState::Thinking | AssistantState::Speaking => {
+            tts::stop(tts_player).await;
+
+            match stt::start_recording(audio_recorder).await {
+                Ok(()) => {
+                    let mut s = shared.lock().await;
+                    s.state = AssistantState::Listening;
+                    s.message = "⚡ Interupsi! Silakan bicara...".into();
+                }
+                Err(e) => {
+                    let mut s = shared.lock().await;
+                    s.state = AssistantState::Error;
+                    s.message = format!("❌ Gagal mulai rekam: {}", e);
+                }
+            }
+            broadcast_state(app, shared).await;
+        }
+
+        // ── Batalkan konfirmasi jika menekan Super+V saat confirm
+        AssistantState::Confirm => {
+            let mut s = shared.lock().await;
+            s.state = AssistantState::Idle;
+            s.pending_command = None;
+            s.message = "Eksekusi perintah dibatalkan.".into();
+            drop(s);
+            broadcast_state(app, shared).await;
+        }
+    }
+}
+
+==> src-tauri/src/state.rs <==
+// src-tauri/src/state.rs
+// Definisi tipe state global asisten, dipakai di seluruh modul.
+
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use tokio::sync::Mutex;
+
+/// Enam state utama avatar Aoi
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum AssistantState {
+    Idle,
+    Listening,
+    Thinking,
+    Speaking,
+    Confirm,
+    Error,
+}
+
+/// Payload yang dikirim ke Vue frontend & ditulis ke /tmp/ai_state.json
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StatePayload {
+    pub state: AssistantState,
+    pub message: String,
+    pub pending_command: Option<String>,
+    pub minimized: bool,
+}
+
+/// Wrapper agar bisa dikelola Tauri sebagai managed state
+pub struct AppState(pub Arc<Mutex<StatePayload>>);
+
+==> src-tauri/src/stt.rs <==
+// src-tauri/src/stt.rs
+// Modul Telinga Lokal (STT): Perekaman PipeWire + Transkripsi Whisper
+//
+// Pipeline:
+//   1. start_recording() → `pw-record --rate 16000 --channels 1 --format s16 /tmp/aoi_mic.wav`
+//   2. stop_recording()  → Hentikan perekaman, pastikan file WAV utuh
+//   3. transcribe()      → Eksekusi whisper.cpp lokal (atau Groq/OpenAI Cloud Whisper fallback)
+
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::sync::Arc;
+use tokio::process::{Child, Command};
+use tokio::sync::Mutex;
+
+use crate::config::AppConfig;
+
+pub const MIC_WAV_PATH: &str = "/tmp/aoi_mic.wav";
+
+pub struct AudioRecorderState(pub Arc<Mutex<Option<Child>>>);
+
+// ────────────────────────────────────────────────────────────────────────────
+// Perekaman Mikrofon (PipeWire Native)
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Mulai merekam mikrofon ke 16kHz mono 16-bit WAV (format standar Whisper)
+pub async fn start_recording(recorder: &Arc<Mutex<Option<Child>>>) -> Result<(), String> {
+    let mut guard = recorder.lock().await;
+
+    // Jika sedang merekam, hentikan dulu yang lama
+    if let Some(mut existing) = guard.take() {
+        let _ = existing.kill().await;
+    }
+
+    // Bersihkan file lama jika ada
+    if Path::new(MIC_WAV_PATH).exists() {
+        let _ = tokio::fs::remove_file(MIC_WAV_PATH).await;
+    }
+
+    // 1. Coba pw-record (PipeWire natif CachyOS)
+    if let Ok(child) = Command::new("pw-record")
+        .args([
+            "--rate", "16000",
+            "--channels", "1",
+            "--format", "s16",
+            MIC_WAV_PATH,
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        *guard = Some(child);
+        return Ok(());
+    }
+
+    // 2. Fallback: parec
+    if let Ok(child) = Command::new("parec")
+        .args([
+            "--rate=16000",
+            "--channels=1",
+            "--format=s16le",
+            "--file-format=wav",
+            MIC_WAV_PATH,
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        *guard = Some(child);
+        return Ok(());
+    }
+
+    // 3. Fallback: arecord (ALSA)
+    if let Ok(child) = Command::new("arecord")
+        .args([
+            "-r", "16000",
+            "-c", "1",
+            "-f", "S16_LE",
+            "-t", "wav",
+            MIC_WAV_PATH,
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        *guard = Some(child);
+        return Ok(());
+    }
+
+    Err("Tidak ditemukan alat perekam audio (pw-record / parec / arecord).".into())
+}
+
+/// Hentikan perekaman dan pastikan file audio tersimpan
+pub async fn stop_recording(recorder: &Arc<Mutex<Option<Child>>>) -> Result<String, String> {
+    let mut guard = recorder.lock().await;
+    let mut child = guard.take().ok_or("Tidak ada sesi perekaman yang aktif.")?;
+
+    // Hentikan proses perekam
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+
+    // Beri sedikit jeda agar buffer flush ke filesystem
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    if !Path::new(MIC_WAV_PATH).exists() {
+        return Err("File audio /tmp/aoi_mic.wav tidak berhasil dibuat.".into());
+    }
+
+    let meta = tokio::fs::metadata(MIC_WAV_PATH)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if meta.len() < 100 {
+        return Err("Audio rekaman kosong atau terlalu pendek.".into());
+    }
+
+    Ok(MIC_WAV_PATH.to_string())
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Transkripsi Audio (Whisper STT)
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Deteksi binary whisper di sistem
+pub async fn find_whisper_binary() -> Option<&'static str> {
+    let candidates = ["whisper-cli", "whisper-cpp", "whisper-main", "whisper"];
+    for bin in candidates {
+        if which_exists(bin).await {
+            return Some(bin);
+        }
+    }
+    None
+}
+
+/// Cari model ggml whisper
+pub fn find_whisper_model(custom_path: &str) -> Option<PathBuf> {
+    // 1. Path kustom dari config
+    if !custom_path.is_empty() {
+        let p = PathBuf::from(custom_path);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+
+    // 2. Env variable
+    if let Ok(env_p) = std::env::var("AOI_WHISPER_MODEL") {
+        let p = PathBuf::from(&env_p);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+
+    // 3. ~/.local/share/whisper/*.bin
+    if let Ok(home) = std::env::var("HOME") {
+        let dir = PathBuf::from(&home).join(".local/share/whisper");
+        if let Some(m) = first_bin_in(&dir) {
+            return Some(m);
+        }
+    }
+
+    // 4. /usr/share/whisper-cpp/*.bin atau /usr/share/whisper/*.bin
+    for sys in &["/usr/share/whisper-cpp", "/usr/share/whisper"] {
+        if let Some(m) = first_bin_in(&PathBuf::from(sys)) {
+            return Some(m);
+        }
+    }
+
+    None
+}
+
+fn first_bin_in(dir: &PathBuf) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    let mut models: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            let ext = p.extension().and_then(|e| e.to_str());
+            ext == Some("bin") || ext == Some("ggml")
+        })
+        .collect();
+    models.sort();
+    models.into_iter().next()
+}
+
+async fn which_exists(bin: &str) -> bool {
+    Command::new("which")
+        .arg(bin)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Transkripsi file audio menjadi teks.
+/// Mencoba whisper.cpp lokal terlebih dahulu; jika tidak tersedia,
+/// mencoba Cloud Whisper API (Groq / OpenAI) jika API key tersedia.
+pub async fn transcribe(wav_path: &str, config: &AppConfig) -> Result<String, String> {
+    // ── 1. Coba Whisper.cpp Lokal
+    if let Some(bin) = find_whisper_binary().await {
+        if let Some(model) = find_whisper_model(&config.whisper_model_path) {
+            let output = Command::new(bin)
+                .args([
+                    "-m", model.to_str().unwrap_or(""),
+                    "-f", wav_path,
+                    "--no-timestamps",
+                ])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .output()
+                .await
+                .map_err(|e| format!("Gagal menjalankan whisper: {}", e))?;
+
+            if output.status.success() {
+                let text = String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .map(|l| l.trim())
+                    .filter(|l| !l.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+
+                if !text.is_empty() {
+                    return Ok(text);
+                }
+            }
+        }
+    }
+
+    // ── 2. Fallback: Cloud Whisper (Groq / OpenAI)
+    if !config.groq_api_key.is_empty() {
+        return transcribe_groq(wav_path, &config.groq_api_key).await;
+    }
+
+    if !config.openai_api_key.is_empty() {
+        return transcribe_openai(wav_path, &config.openai_api_key).await;
+    }
+
+    Err(
+        "Whisper STT lokal belum terpasang dan API Key Cloud belum dikonfigurasi.\n\
+         Silakan pasang whisper-cpp (sudo pacman -S whisper-cpp) dan unduh model ggml ke ~/.local/share/whisper/,\n\
+         atau isi GROQ_API_KEY di pengaturan untuk STT awan ultra-cepat."
+            .into(),
+    )
+}
+
+/// Transkripsi via Groq Whisper API (whisper-large-v3, latensi ~150ms)
+async fn transcribe_groq(wav_path: &str, api_key: &str) -> Result<String, String> {
+    let client = reqwest::Client::new();
+    let audio_bytes = tokio::fs::read(wav_path)
+        .await
+        .map_err(|e| format!("Gagal membaca file audio: {}", e))?;
+
+    let file_part = reqwest::multipart::Part::bytes(audio_bytes)
+        .file_name("audio.wav")
+        .mime_str("audio/wav")
+        .map_err(|e| e.to_string())?;
+
+    let form = reqwest::multipart::Form::new()
+        .text("model", "whisper-large-v3")
+        .part("file", file_part);
+
+    let resp = client
+        .post("https://api.groq.com/openai/v1/audio/transcriptions")
+        .bearer_auth(api_key)
+        .multipart(form)
+        .send()
+        .await
+        .map_err(|e| format!("HTTP request error ke Groq: {}", e))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let err_txt = resp.text().await.unwrap_or_default();
+        return Err(format!("Groq Whisper error {}: {}", status, err_txt));
+    }
+
+    let json: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+    let text = json["text"].as_str().unwrap_or("").trim().to_string();
+
+    if text.is_empty() {
+        Err("Suara tidak terdengar jelas.".into())
+    } else {
+        Ok(text)
+    }
+}
+
+/// Transkripsi via OpenAI Whisper API
+async fn transcribe_openai(wav_path: &str, api_key: &str) -> Result<String, String> {
+    let client = reqwest::Client::new();
+    let audio_bytes = tokio::fs::read(wav_path)
+        .await
+        .map_err(|e| format!("Gagal membaca audio: {}", e))?;
+
+    let file_part = reqwest::multipart::Part::bytes(audio_bytes)
+        .file_name("audio.wav")
+        .mime_str("audio/wav")
+        .map_err(|e| e.to_string())?;
+
+    let form = reqwest::multipart::Form::new()
+        .text("model", "whisper-1")
+        .part("file", file_part);
+
+    let resp = client
+        .post("https://api.openai.com/v1/audio/transcriptions")
+        .bearer_auth(api_key)
+        .multipart(form)
+        .send()
+        .await
+        .map_err(|e| format!("HTTP request error ke OpenAI: {}", e))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let err_txt = resp.text().await.unwrap_or_default();
+        return Err(format!("OpenAI Whisper error {}: {}", status, err_txt));
+    }
+
+    let json: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+    let text = json["text"].as_str().unwrap_or("").trim().to_string();
+
+    if text.is_empty() {
+        Err("Suara tidak terdengar jelas.".into())
+    } else {
+        Ok(text)
+    }
+}
+
+==> src-tauri/src/tts.rs <==
+// src-tauri/src/tts.rs
+// Tahap 3: Local TTS (Piper / Kokoro / sherpa-onnx) + Real-Time RMS Lip-Sync
+//
+// Pipeline:
+//   text → piper/sherpa-onnx (stdin→wav) → parse PCM → RMS chunks
+//         → pw-play (PipeWire) subprocess + emit lip-sync events ke Vue
+//
+// Fallback playback: pw-play → paplay → aplay
+// Fallback TTS: jika engine belum terinstall, simulasi lip-sync adaptif
+//               berdasarkan panjang teks agar avatar tetap interaktif dan tidak crash.
+
+use std::path::PathBuf;
+use std::process::Stdio;
+use std::sync::Arc;
+
+use serde_json::json;
+use tauri::{AppHandle, Emitter};
+use tokio::io::AsyncWriteExt;
+use tokio::process::{Child, Command};
+use tokio::sync::Mutex;
+
+use crate::broadcast_state;
+use crate::state::{AssistantState, StatePayload};
+
+// ────────────────────────────────────────────────────────────────────────────
+// State global untuk handle proses pw-play (dibutuhkan barge-in kill)
+// ────────────────────────────────────────────────────────────────────────────
+
+pub struct TtsPlayerState(pub Arc<Mutex<Option<Child>>>);
+
+// ────────────────────────────────────────────────────────────────────────────
+// Text Cleaner: Bersihkan markdown / code block sebelum dikirim ke TTS
+// ────────────────────────────────────────────────────────────────────────────
+
+pub fn clean_text_for_tts(raw: &str) -> String {
+    // 1. Singkirkan baris BASH:
+    let without_bash = crate::bash_executor::strip_bash_command(raw);
+
+    // 2. Singkirkan blok kode ```...```
+    let mut cleaned = String::new();
+    let mut in_code_block = false;
+    for line in without_bash.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("```") {
+            in_code_block = !in_code_block;
+            continue;
+        }
+        if !in_code_block {
+            cleaned.push_str(line);
+            cleaned.push(' ');
+        }
+    }
+
+    // 3. Singkirkan markdown markup (*, #, `, >, ~, [], ())
+    let mut sanitized = String::new();
+    for c in cleaned.chars() {
+        if matches!(c, '*' | '#' | '`' | '~' | '>' | '[' | ']') {
+            continue;
+        }
+        sanitized.push(c);
+    }
+
+    let result = sanitized.trim();
+    if result.is_empty() {
+        "Perintah berhasil dieksekusi.".to_string()
+    } else {
+        result.to_string()
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Pencarian model Piper / Kokoro ONNX
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Cari file model .onnx dari berbagai lokasi umum
+pub fn find_piper_model() -> Option<PathBuf> {
+    // 1. Override via environment variable
+    if let Ok(model) = std::env::var("AOI_TTS_MODEL") {
+        let p = PathBuf::from(&model);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+
+    // 2. ~/.local/share/piper/*.onnx
+    if let Ok(home) = std::env::var("HOME") {
+        let dir = PathBuf::from(&home).join(".local/share/piper");
+        if let Some(m) = first_onnx_in(&dir) {
+            return Some(m);
+        }
+    }
+
+    // 3. ~/.local/share/kokoro/*.onnx
+    if let Ok(home) = std::env::var("HOME") {
+        let dir = PathBuf::from(&home).join(".local/share/kokoro");
+        if let Some(m) = first_onnx_in(&dir) {
+            return Some(m);
+        }
+    }
+
+    // 4. /usr/share/piper/voices/*.onnx
+    let sys = PathBuf::from("/usr/share/piper/voices");
+    if let Some(m) = first_onnx_in(&sys) {
+        return Some(m);
+    }
+
+    // 5. /usr/share/piper/*.onnx
+    let sys2 = PathBuf::from("/usr/share/piper");
+    first_onnx_in(&sys2)
+}
+
+fn first_onnx_in(dir: &PathBuf) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    let mut models: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("onnx"))
+        .collect();
+    models.sort();
+    models.into_iter().next()
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Lip-Sync: Parse WAV PCM → RMS per chunk → jadwal (delay_ms, is_mouth_open)
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Hitung jadwal lip-sync dari WAV PCM data.
+/// Returns: Vec<(delay_ms_dari_awal, is_mouth_open)>
+/// chunk_ms: durasi tiap frame animasi (default 140ms)
+pub fn compute_lipsync_schedule(wav: &[u8], chunk_ms: u64) -> Vec<(u64, bool)> {
+    if wav.len() < 44 {
+        return vec![];
+    }
+
+    let sample_rate =
+        u32::from_le_bytes([wav[24], wav[25], wav[26], wav[27]]) as u64;
+    let bits_per_sample =
+        u16::from_le_bytes([wav[34], wav[35]]) as u64;
+    let bytes_per_sample = (bits_per_sample / 8).max(1);
+
+    if sample_rate == 0 {
+        return vec![];
+    }
+
+    let pcm = &wav[44..];
+    let samples_per_chunk = ((sample_rate * chunk_ms) / 1000) as usize;
+    let bytes_per_chunk = (samples_per_chunk * bytes_per_sample as usize).max(2);
+
+    let threshold = match bits_per_sample {
+        16 => 1100.0f64,
+        8  => 12.0,
+        _  => 1100.0,
+    };
+
+    let mut out = Vec::new();
+    let mut delay = 0u64;
+
+    for chunk in pcm.chunks(bytes_per_chunk) {
+        let rms = match bits_per_sample {
+            16 => {
+                let sum: f64 = chunk
+                    .chunks_exact(2)
+                    .map(|b| {
+                        let s = i16::from_le_bytes([b[0], b[1]]) as f64;
+                        s * s
+                    })
+                    .sum();
+                let n = (chunk.len() / 2).max(1);
+                (sum / n as f64).sqrt()
+            }
+            _ => {
+                let sum: f64 = chunk
+                    .iter()
+                    .map(|&b| {
+                        let s = b as f64 - 128.0;
+                        s * s
+                    })
+                    .sum();
+                (sum / chunk.len().max(1) as f64).sqrt()
+            }
+        };
+
+        out.push((delay, rms > threshold));
+        delay += chunk_ms;
+    }
+
+    out
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// TTS Pipeline
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Main entry: text → TTS synthesis → PipeWire playback + lip-sync events → Idle.
+pub async fn speak(
+    text: String,
+    app: AppHandle,
+    assistant_state: Arc<Mutex<StatePayload>>,
+    player_state: Arc<Mutex<Option<Child>>>,
+) {
+    let wav_path = "/tmp/aoi_tts.wav";
+    let cleaned = clean_text_for_tts(&text);
+
+    // ── 1. Cari model dan binary engine
+    let model = find_piper_model();
+
+    if model.is_none() {
+        eprintln!(
+            "ℹ️ Info: Model Piper belum ditemukan di ~/.local/share/piper/*.onnx\n\
+             Menjalankan simulated lip-sync berdasarkan panjang kalimat.\n\
+             Untuk mengaktifkan suara: yay -S piper-tts-bin dan unduh model onnx."
+        );
+        // Simulasi lip-sync cerdas agar visual tetap berbicara natural
+        simulate_speech(&cleaned, &app, &assistant_state, &player_state).await;
+        return;
+    }
+
+    let model_path = model.unwrap();
+
+    // ── 2. Generate WAV via piper
+    if let Err(e) = generate_wav(&cleaned, &model_path, wav_path).await {
+        eprintln!("TTS synthesis gagal ({}), beralih ke simulated lip-sync.", e);
+        simulate_speech(&cleaned, &app, &assistant_state, &player_state).await;
+        return;
+    }
+
+    // ── 3. Baca WAV + hitung jadwal lip-sync dari amplitudo RMS
+    let wav_data = match tokio::fs::read(wav_path).await {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("Gagal baca WAV: {}", e);
+            finish_speech(&app, &assistant_state).await;
+            return;
+        }
+    };
+
+    let schedule = compute_lipsync_schedule(&wav_data, 140);
+
+    // ── 4. Mulai playback audio PipeWire
+    let player = match start_playback(wav_path).await {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Audio playback error: {}", e);
+            finish_speech(&app, &assistant_state).await;
+            return;
+        }
+    };
+
+    *player_state.lock().await = Some(player);
+
+    // ── 5. Emit real-time lip-sync events mengikuti RMS audio
+    let start = tokio::time::Instant::now();
+
+    for (delay_ms, is_open) in &schedule {
+        let target = start + tokio::time::Duration::from_millis(*delay_ms);
+        let now = tokio::time::Instant::now();
+        if now < target {
+            tokio::time::sleep(target - now).await;
+        }
+
+        // Jika user melakukan barge-in (Super+V), hentikan loop
+        if player_state.lock().await.is_none() {
+            break;
+        }
+
+        let _ = app.emit("lip-sync-update", json!({ "is_mouth_open": is_open }));
+    }
+
+    // ── 6. Tunggu proses player selesai jika belum di-kill
+    {
+        let mut guard = player_state.lock().await;
+        if let Some(mut child) = guard.take() {
+            let _ = child.wait().await;
+        }
+    }
+
+    // ── 7. Tutup mulut & kembalikan state ke Idle (pertahankan pesan yang sudah tampil)
+    finish_speech(&app, &assistant_state).await;
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Simulated Speech Fallback (Jika Piper/TTS belum terinstall)
+// ────────────────────────────────────────────────────────────────────────────
+
+async fn simulate_speech(
+    text: &str,
+    app: &AppHandle,
+    assistant_state: &Arc<Mutex<StatePayload>>,
+    player_state: &Arc<Mutex<Option<Child>>>,
+) {
+    let word_count = text.split_whitespace().count().max(1);
+    // Estimasi membaca: ~160 kata/menit = ~375ms per kata
+    // Dibatasi antara 1.5 detik s/d 7 detik
+    let total_ms = ((word_count as u64) * 375).clamp(1500, 7000);
+    let frames = total_ms / 140;
+
+    let mut mouth_open = false;
+    for i in 0..frames {
+        // Cek interupsi barge-in
+        {
+            let s = assistant_state.lock().await;
+            if s.state != AssistantState::Speaking {
+                break;
+            }
+        }
+        if player_state.lock().await.is_some() {
+            // jika ada sinyal kill
+        }
+
+        // Variasi buka-tutup mulut yang lebih natural
+        if i % 2 == 0 {
+            mouth_open = !mouth_open;
+        }
+        let _ = app.emit("lip-sync-update", json!({ "is_mouth_open": mouth_open }));
+        tokio::time::sleep(tokio::time::Duration::from_millis(140)).await;
+    }
+
+    finish_speech(app, assistant_state).await;
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Helpers
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Selesai berbicara: tutup mulut, ubah state ke Idle, jaga pesan dialog tetap tampil
+async fn finish_speech(
+    app: &AppHandle,
+    assistant_state: &Arc<Mutex<StatePayload>>,
+) {
+    let _ = app.emit("lip-sync-update", json!({ "is_mouth_open": false }));
+    {
+        let mut s = assistant_state.lock().await;
+        if s.state == AssistantState::Speaking {
+            s.state = AssistantState::Idle;
+        }
+    }
+    broadcast_state(app, assistant_state).await;
+}
+
+/// Jalankan piper dengan teks dari stdin, output ke file WAV
+async fn generate_wav(text: &str, model: &PathBuf, output: &str) -> Result<(), String> {
+    // Coba binary 'piper' terlebih dahulu, lalu 'piper-tts'
+    let bin = if which_exists("piper").await {
+        "piper"
+    } else if which_exists("piper-tts").await {
+        "piper-tts"
+    } else {
+        return Err("Binary piper / piper-tts tidak ditemukan di PATH".into());
+    };
+
+    let mut child = Command::new(bin)
+        .args([
+            "--model",
+            model.to_str().unwrap_or(""),
+            "--output_file",
+            output,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("Gagal menjalankan {}: {}", bin, e))?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(text.as_bytes())
+            .await
+            .map_err(|e| format!("Gagal menulis ke stdin: {}", e))?;
+        stdin
+            .flush()
+            .await
+            .map_err(|e| format!("Gagal flush stdin: {}", e))?;
+    }
+
+    let status = child
+        .wait()
+        .await
+        .map_err(|e| format!("Wait process error: {}", e))?;
+
+    if !status.success() {
+        return Err(format!("Process exit code: {:?}", status.code()));
+    }
+
+    Ok(())
+}
+
+async fn which_exists(bin: &str) -> bool {
+    Command::new("which")
+        .arg(bin)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Mulai playback WAV — coba pw-play, paplay, lalu aplay
+async fn start_playback(wav_path: &str) -> Result<Child, String> {
+    // PipeWire (Primary — CachyOS default)
+    if let Ok(c) = Command::new("pw-play")
+        .arg(wav_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        return Ok(c);
+    }
+
+    // PulseAudio fallback
+    if let Ok(c) = Command::new("paplay")
+        .arg(wav_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        return Ok(c);
+    }
+
+    // ALSA fallback
+    Command::new("aplay")
+        .arg(wav_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|_| {
+            "Tidak ada audio player yang dapat memutar audio (install: pipewire)".into()
+        })
+}
+
+/// Hentikan TTS yang sedang berjalan (dipanggil saat barge-in)
+pub async fn stop(player_state: &Arc<Mutex<Option<Child>>>) {
+    let mut guard = player_state.lock().await;
+    if let Some(mut child) = guard.take() {
+        let _ = child.kill().await;
+    }
+}
+
+==> src-tauri/Cargo.toml <==
+[package]
+name = "ai-hypr-assistant"
+version = "0.1.0"
+description = "Lightweight 2D AI Desktop Assistant for CachyOS + Hyprland"
+authors = ["rasshqa"]
+edition = "2021"
+
+[lib]
+name = "ai_hypr_assistant_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP client untuk Gemini / OpenAI / OpenRouter / Ollama / Cloud Whisper
+reqwest = { version = "0.12", features = ["json", "multipart", "rustls-tls"], default-features = false }
+
+# Async channel untuk konfirmasi Red Tier
+tokio-util = { version = "0.7", features = [] }
+
+# Base64 decoder untuk upload custom sprite avatar
+base64 = "0.22"
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+panic = "abort"
+strip = true
+
+==> src/App.vue <==
+<script setup lang="ts">
+import { ref, onMounted, onUnmounted, computed } from 'vue';
+import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
+import { getCurrentWindow } from '@tauri-apps/api/window';
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tipe Data
+// ─────────────────────────────────────────────────────────────────────────────
+type AssistantState = 'idle' | 'listening' | 'thinking' | 'speaking' | 'confirm' | 'error';
+
+interface StatePayload {
+  state: AssistantState;
+  message: string;
+  pending_command: string | null;
+  minimized: boolean;
+}
+
+interface AppConfig {
+  llm_provider: string;
+  gemini_api_key: string;
+  groq_api_key: string;
+  openai_api_key: string;
+  openrouter_api_key: string;
+  ollama_base_url: string;
+  custom_api_key: string;
+  custom_api_endpoint: string;
+  model_name: string;
+  tts_model_path: string;
+  whisper_model_path: string;
+  avatar_folder_path: string;
+}
+
+interface LipSyncPayload {
+  is_mouth_open: boolean;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// State reaktif
+// ─────────────────────────────────────────────────────────────────────────────
+const currentState = ref<AssistantState>('idle');
+const message = ref<string>('Halo! Tekan Super+V untuk mulai ngobrol.');
+const pendingCommand = ref<string | null>(null);
+const isMinimized = ref<boolean>(false);
+const ghostMode = ref<boolean>(false);
+const showDevToolbar = ref<boolean>(false);
+const showSettings = ref<boolean>(false);
+
+// Input chat untuk mengetik langsung di UI
+const chatInput = ref<string>('');
+const isSendingChat = ref<boolean>(false);
+
+// Animasi 2D frame
+const isBlinking = ref<boolean>(false);
+const isMouthOpen = ref<boolean>(false);
+
+// Pengaturan Konfigurasi
+const configData = ref<AppConfig>({
+  llm_provider: 'gemini',
+  gemini_api_key: '',
+  groq_api_key: '',
+  openai_api_key: '',
+  openrouter_api_key: '',
+  ollama_base_url: 'http://localhost:11434',
+  custom_api_key: '',
+  custom_api_endpoint: '',
+  model_name: 'gemini-2.0-flash',
+  tts_model_path: '',
+  whisper_model_path: '',
+  avatar_folder_path: '',
+});
+const isSavingConfig = ref<boolean>(false);
+
+// Custom avatar pack (kosong = pakai SVG built-in)
+const customAvatarPack = ref<Record<string, string>>({
+  idle_open: '', idle_blink: '', listening: '',
+  thinking: '', speak_closed: '', speak_open: '',
+  confirm: '', error: ''
+});
+
+let blinkInterval: number | null = null;
+let lipSyncInterval: number | null = null;
+let unlistenEvent: (() => void) | null = null;
+let unlistenLipSync: (() => void) | null = null;
+let lastLipSyncEventTime = 0;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Computed
+// ─────────────────────────────────────────────────────────────────────────────
+const stateBadgeColor = computed(() => {
+  switch (currentState.value) {
+    case 'listening': return 'bg-emerald-500 shadow-emerald-500/50';
+    case 'thinking':  return 'bg-amber-500  shadow-amber-500/50';
+    case 'speaking':  return 'bg-sky-500    shadow-sky-500/50';
+    case 'confirm':   return 'bg-purple-500 shadow-purple-500/50';
+    case 'error':     return 'bg-rose-500   shadow-rose-500/50';
+    default:          return 'bg-slate-400';
+  }
+});
+
+const stateLabel = computed(() => {
+  const labels: Record<AssistantState, string> = {
+    idle: 'Idle', listening: 'Listening ●', thinking: 'Thinking...',
+    speaking: 'Speaking', confirm: 'Confirm?', error: 'Error'
+  };
+  return labels[currentState.value];
+});
+
+const activeCustomFrame = computed(() => {
+  const pack = customAvatarPack.value;
+  // Jika seluruh pack kosong, return empty string agar SVG bawaan yang aktif
+  const hasAnyCustom = Object.values(pack).some(v => Boolean(v && v.trim()));
+  if (!hasAnyCustom) return '';
+
+  if (currentState.value === 'idle') {
+    if (isBlinking.value && pack.idle_blink) return pack.idle_blink;
+    return pack.idle_open || pack.idle_blink || '';
+  }
+  if (currentState.value === 'speaking') {
+    if (isMouthOpen.value && pack.speak_open) return pack.speak_open;
+    return pack.speak_closed || pack.speak_open || pack.idle_open || '';
+  }
+  return pack[currentState.value] || pack.idle_open || '';
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Animasi
+// ─────────────────────────────────────────────────────────────────────────────
+const startBlinkTimer = () => {
+  blinkInterval = window.setInterval(() => {
+    if (currentState.value === 'idle' || currentState.value === 'listening') {
+      isBlinking.value = true;
+      setTimeout(() => { isBlinking.value = false; }, 160);
+    }
+  }, 4000);
+};
+
+const startLipSyncTimer = () => {
+  lipSyncInterval = window.setInterval(() => {
+    // Jika tidak ada sinyal RMS audio live dalam 300ms, gunakan natural fallback toggle
+    if (Date.now() - lastLipSyncEventTime > 300) {
+      if (currentState.value === 'speaking') {
+        isMouthOpen.value = !isMouthOpen.value;
+      } else {
+        isMouthOpen.value = false;
+      }
+    }
+  }, 140);
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Drag window
+// ─────────────────────────────────────────────────────────────────────────────
+const startDrag = async () => {
+  try { await getCurrentWindow().startDragging(); }
+  catch (e) { console.warn('Drag hanya berjalan dalam Tauri window:', e); }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tauri Commands
+// ─────────────────────────────────────────────────────────────────────────────
+const triggerState = async (
+  state: AssistantState,
+  msg: string,
+  cmd: string | null = null
+) => {
+  try {
+    await invoke('set_manual_state', { newState: state, message: msg, command: cmd });
+  } catch {
+    currentState.value = state;
+    message.value = msg;
+    pendingCommand.value = cmd;
+  }
+};
+
+const toggleMinimize = async () => {
+  try { await invoke('toggle_minimize'); }
+  catch { isMinimized.value = !isMinimized.value; }
+};
+
+const toggleMic = async () => {
+  try {
+    await invoke('trigger_mic');
+  } catch (e) {
+    console.error('Trigger mic error:', e);
+  }
+};
+
+// Kirim pesan chat ke LLM
+const sendChat = async () => {
+  const text = chatInput.value.trim();
+  if (!text || isSendingChat.value) return;
+
+  chatInput.value = '';
+  isSendingChat.value = true;
+
+  try {
+    await invoke('ask_llm', { userMessage: text });
+  } catch (e) {
+    console.error('LLM error:', e);
+  } finally {
+    isSendingChat.value = false;
+  }
+};
+
+const handleChatKeydown = (e: KeyboardEvent) => {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    sendChat();
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Pengaturan & Kustomisasi Sprite
+// ─────────────────────────────────────────────────────────────────────────────
+const activeSettingsTab = ref<'ai' | 'avatar'>('ai');
+
+const avatarFrameList = [
+  { key: 'idle_open', label: 'Idle (Mata Buka)', desc: 'Frame diam normal' },
+  { key: 'idle_blink', label: 'Idle (Kedip)', desc: 'Frame mata tertutup' },
+  { key: 'listening', label: 'Mendengarkan', desc: 'Saat mic aktif' },
+  { key: 'thinking', label: 'Berpikir', desc: 'Saat LLM memproses' },
+  { key: 'speak_open', label: 'Bicara (Mulut Buka)', desc: 'Lip-sync frame 2' },
+  { key: 'speak_closed', label: 'Bicara (Mulut Tutup)', desc: 'Lip-sync frame 1' },
+  { key: 'confirm', label: 'Konfirmasi', desc: 'Dialog bash Alt+Y' },
+  { key: 'error', label: 'Error', desc: 'Koneksi gagal / error' },
+];
+
+const loadCustomAvatar = async (folder?: string) => {
+  try {
+    const pack = await invoke<Record<string, string>>('load_avatar_pack', { folderOverride: folder || null });
+    if (pack && Object.keys(pack).length > 0) {
+      customAvatarPack.value = { ...customAvatarPack.value, ...pack };
+    }
+  } catch (e) {
+    console.warn('Gagal memuat avatar pack:', e);
+  }
+};
+
+const handleSpriteUpload = (event: Event, frameKey: string) => {
+  const target = event.target as HTMLInputElement;
+  if (!target.files || target.files.length === 0) return;
+  const file = target.files[0];
+  const reader = new FileReader();
+  reader.onload = async () => {
+    const dataUrl = reader.result as string;
+    customAvatarPack.value[frameKey] = dataUrl;
+    try {
+      await invoke('save_avatar_sprite', { frameName: frameKey, dataUrl });
+    } catch (e) {
+      console.error('Gagal menyimpan sprite ke disk:', e);
+    }
+  };
+  reader.readAsDataURL(file);
+};
+
+const handleBatchUpload = (event: Event) => {
+  const target = event.target as HTMLInputElement;
+  if (!target.files || target.files.length === 0) return;
+  const file = target.files[0];
+  const reader = new FileReader();
+  reader.onload = async () => {
+    const dataUrl = reader.result as string;
+    for (const item of avatarFrameList) {
+      customAvatarPack.value[item.key] = dataUrl;
+    }
+    try {
+      await invoke('save_avatar_pack', { pack: customAvatarPack.value });
+    } catch (e) {
+      console.error('Gagal menyimpan avatar pack:', e);
+    }
+  };
+  reader.readAsDataURL(file);
+};
+
+const removeSingleSprite = async (frameKey: string) => {
+  customAvatarPack.value[frameKey] = '';
+  try {
+    await invoke('save_avatar_pack', { pack: customAvatarPack.value });
+  } catch (e) {
+    console.error('Gagal mengupdate sprite:', e);
+  }
+};
+
+const resetToBuiltInAvatar = async () => {
+  for (const item of avatarFrameList) {
+    customAvatarPack.value[item.key] = '';
+  }
+  try {
+    await invoke('reset_avatar_pack');
+  } catch (e) {
+    console.error('Gagal reset avatar pack:', e);
+  }
+};
+
+const openSettings = async () => {
+  try {
+    const loaded = await invoke<AppConfig>('get_config');
+    configData.value = loaded;
+  } catch (e) {
+    console.warn('Gagal membaca config:', e);
+  }
+  showSettings.value = true;
+};
+
+const saveSettings = async () => {
+  isSavingConfig.value = true;
+  try {
+    await invoke('save_config', { cfg: configData.value });
+    showSettings.value = false;
+  } catch (e) {
+    console.error('Gagal menyimpan config:', e);
+  } finally {
+    isSavingConfig.value = false;
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Lifecycle
+// ─────────────────────────────────────────────────────────────────────────────
+onMounted(async () => {
+  startBlinkTimer();
+  startLipSyncTimer();
+
+  try {
+    const initial = await invoke<StatePayload>('get_current_state');
+    currentState.value = initial.state;
+    message.value = initial.message;
+    pendingCommand.value = initial.pending_command;
+    isMinimized.value = initial.minimized;
+
+    unlistenEvent = await listen<StatePayload>('assistant-state-changed', (event) => {
+      currentState.value = event.payload.state;
+      message.value = event.payload.message;
+      pendingCommand.value = event.payload.pending_command;
+      isMinimized.value = event.payload.minimized;
+    });
+
+    unlistenLipSync = await listen<LipSyncPayload>('lip-sync-update', (event) => {
+      lastLipSyncEventTime = Date.now();
+      isMouthOpen.value = event.payload.is_mouth_open;
+    });
+
+    await loadCustomAvatar();
+  } catch {
+    console.info('Mode preview web — tanpa koneksi Tauri backend.');
+  }
+});
+
+onUnmounted(() => {
+  if (blinkInterval)  clearInterval(blinkInterval);
+  if (lipSyncInterval) clearInterval(lipSyncInterval);
+  if (unlistenEvent)  unlistenEvent();
+  if (unlistenLipSync) unlistenLipSync();
+});
+</script>
+
+<template>
+  <div
+    class="w-screen h-screen overflow-hidden select-none flex flex-col items-end justify-end p-3 transition-opacity duration-300"
+    :class="{ 'opacity-35 hover:opacity-100 transition-opacity': ghostMode }"
+    @contextmenu.prevent="showDevToolbar = !showDevToolbar"
+  >
+
+    <!-- ══════════════════════════════════════════════ -->
+    <!-- MODE MINIMIZE: Pill mengambang kecil           -->
+    <!-- ══════════════════════════════════════════════ -->
+    <div
+      v-if="isMinimized"
+      @mousedown="startDrag"
+      class="flex items-center gap-2 bg-slate-900/90 backdrop-blur-md border border-slate-700/80 px-3.5 py-2 rounded-full shadow-lg cursor-move"
+    >
+      <span class="w-2.5 h-2.5 rounded-full animate-pulse shadow-sm" :class="stateBadgeColor" />
+      <span class="text-xs font-medium text-slate-200 uppercase tracking-wider">{{ stateLabel }}</span>
+      <button
+        @click.stop="toggleMinimize"
+        class="ml-1 text-xs text-sky-400 hover:text-sky-300 font-semibold"
+      >▲ Buka</button>
+    </div>
+
+    <!-- ══════════════════════════════════════════════ -->
+    <!-- MODE UTAMA                                     -->
+    <!-- ══════════════════════════════════════════════ -->
+    <div v-else class="w-full max-w-[320px] flex flex-col items-center gap-2">
+
+      <!-- ── Panel Modal Pengaturan & Kustomisasi Sprite ── -->
+      <div 
+        v-if="showSettings" 
+        class="w-full bg-slate-900/95 backdrop-blur-md border border-slate-700/90 rounded-2xl p-3 shadow-2xl text-slate-100 flex flex-col gap-2 animate-fade-in"
+      >
+        <div class="flex items-center justify-between border-b border-slate-800 pb-1.5">
+          <!-- Tab selector -->
+          <div class="flex items-center gap-1">
+            <button 
+              @click="activeSettingsTab = 'ai'"
+              class="text-[10px] font-bold px-2 py-0.5 rounded transition"
+              :class="activeSettingsTab === 'ai' ? 'bg-sky-600 text-white shadow-sm' : 'text-slate-400 hover:text-slate-200 bg-slate-800/80'"
+            >
+              ⚙️ AI & Model
+            </button>
+            <button 
+              @click="activeSettingsTab = 'avatar'"
+              class="text-[10px] font-bold px-2 py-0.5 rounded transition"
+              :class="activeSettingsTab === 'avatar' ? 'bg-sky-600 text-white shadow-sm' : 'text-slate-400 hover:text-slate-200 bg-slate-800/80'"
+            >
+              🎭 Sprite Avatar
+            </button>
+          </div>
+          <button @click="showSettings = false" class="text-xs text-slate-400 hover:text-white px-1">✕</button>
+        </div>
+
+        <!-- ── TAB 1: AI & Provider Settings ── -->
+        <div v-if="activeSettingsTab === 'ai'" class="space-y-2 text-[10px] max-h-[230px] overflow-y-auto pr-1">
+          <div>
+            <label class="block text-slate-400 font-medium mb-0.5">Provider LLM</label>
+            <select 
+              v-model="configData.llm_provider"
+              class="w-full bg-slate-800 border border-slate-700 rounded px-2 py-1 text-slate-200 outline-none"
+            >
+              <option value="gemini">Google Gemini</option>
+              <option value="groq">Groq (Ultra-Fast)</option>
+              <option value="openai">OpenAI</option>
+              <option value="openrouter">OpenRouter</option>
+              <option value="ollama">Ollama (Lokal)</option>
+              <option value="custom">Custom (OpenAI-Compatible)</option>
+            </select>
+          </div>
+
+          <div>
+            <label class="block text-slate-400 font-medium mb-0.5">Nama Model</label>
+            <input 
+              v-model="configData.model_name" 
+              placeholder="e.g. deepseek-chat / llama-3.3-70b / gemini-2.0-flash"
+              class="w-full bg-slate-800 border border-slate-700 rounded px-2 py-1 text-slate-200 outline-none"
+            />
+          </div>
+
+          <!-- API Key & Endpoint Sesuai Provider -->
+          <div v-if="configData.llm_provider === 'custom'">
+            <label class="block text-slate-400 font-medium mb-0.5">API Endpoint URL</label>
+            <input 
+              v-model="configData.custom_api_endpoint" 
+              placeholder="e.g. https://api.deepseek.com/v1 atau http://localhost:8000/v1"
+              class="w-full bg-slate-800 border border-slate-700 rounded px-2 py-1 text-slate-200 outline-none"
+            />
+            <span class="text-[9px] text-slate-500 mt-0.5 block">Format: https://domain/v1 (otomatis ke /chat/completions)</span>
+          </div>
+
+          <div v-if="configData.llm_provider === 'custom'">
+            <label class="block text-slate-400 font-medium mb-0.5">Custom API Key</label>
+            <input 
+              v-model="configData.custom_api_key" 
+              type="password" 
+              placeholder="sk-... (kosongkan jika local tanpa auth)"
+              class="w-full bg-slate-800 border border-slate-700 rounded px-2 py-1 text-slate-200 outline-none"
+            />
+          </div>
+
+          <div v-if="configData.llm_provider === 'gemini'">
+            <label class="block text-slate-400 font-medium mb-0.5">Gemini API Key</label>
+            <input 
+              v-model="configData.gemini_api_key" 
+              type="password" 
+              placeholder="AIzaSy..."
+              class="w-full bg-slate-800 border border-slate-700 rounded px-2 py-1 text-slate-200 outline-none"
+            />
+          </div>
+
+          <div v-if="configData.llm_provider === 'groq'">
+            <label class="block text-slate-400 font-medium mb-0.5">Groq API Key (juga dipakai untuk Whisper STT)</label>
+            <input 
+              v-model="configData.groq_api_key" 
+              type="password" 
+              placeholder="gsk_..."
+              class="w-full bg-slate-800 border border-slate-700 rounded px-2 py-1 text-slate-200 outline-none"
+            />
+          </div>
+
+          <div v-if="configData.llm_provider === 'openai'">
+            <label class="block text-slate-400 font-medium mb-0.5">OpenAI API Key</label>
+            <input 
+              v-model="configData.openai_api_key" 
+              type="password" 
+              placeholder="sk-..."
+              class="w-full bg-slate-800 border border-slate-700 rounded px-2 py-1 text-slate-200 outline-none"
+            />
+          </div>
+
+          <div v-if="configData.llm_provider === 'openrouter'">
+            <label class="block text-slate-400 font-medium mb-0.5">OpenRouter API Key</label>
+            <input 
+              v-model="configData.openrouter_api_key" 
+              type="password" 
+              placeholder="sk-or-v1-..."
+              class="w-full bg-slate-800 border border-slate-700 rounded px-2 py-1 text-slate-200 outline-none"
+            />
+          </div>
+
+          <div v-if="configData.llm_provider === 'ollama'">
+            <label class="block text-slate-400 font-medium mb-0.5">Ollama Base URL</label>
+            <input 
+              v-model="configData.ollama_base_url" 
+              placeholder="http://localhost:11434"
+              class="w-full bg-slate-800 border border-slate-700 rounded px-2 py-1 text-slate-200 outline-none"
+            />
+          </div>
+
+          <div>
+            <label class="block text-slate-400 font-medium mb-0.5">Folder Avatar Kustom (Opsional)</label>
+            <input 
+              v-model="configData.avatar_folder_path" 
+              placeholder="/home/user/.config/aoi/avatar"
+              class="w-full bg-slate-800 border border-slate-700 rounded px-2 py-1 text-slate-200 outline-none"
+            />
+          </div>
+        </div>
+
+        <!-- ── TAB 2: Upload Sprite Avatar ── -->
+        <div v-else-if="activeSettingsTab === 'avatar'" class="space-y-2 text-[10px] max-h-[230px] overflow-y-auto pr-1">
+          <!-- Aksi Cepat -->
+          <div class="flex items-center justify-between bg-slate-800/80 p-1.5 rounded-lg border border-slate-700/60">
+            <div>
+              <div class="font-bold text-slate-200">Aset 2D Sprite</div>
+              <div class="text-[8px] text-slate-400">Format PNG / WebP transparan (512x512)</div>
+            </div>
+            <div class="flex gap-1">
+              <label class="cursor-pointer bg-sky-700 hover:bg-sky-600 text-white text-[9px] font-bold px-2 py-1 rounded transition flex items-center gap-1">
+                ⚡ 1 Gambar Semua
+                <input type="file" accept="image/png,image/webp,image/jpeg,image/svg+xml" class="hidden" @change="handleBatchUpload" />
+              </label>
+              <button 
+                @click="resetToBuiltInAvatar"
+                title="Reset ke karakter anime SVG bawaan"
+                class="bg-rose-900/60 hover:bg-rose-800 text-rose-200 text-[9px] font-bold px-2 py-1 rounded transition"
+              >
+                ↺ Reset
+              </button>
+            </div>
+          </div>
+
+          <!-- Grid 8 Frame Sprite -->
+          <div class="grid grid-cols-2 gap-1.5">
+            <div 
+              v-for="item in avatarFrameList" 
+              :key="item.key"
+              class="bg-slate-800/60 border border-slate-700/60 rounded-lg p-1.5 flex items-center gap-2 hover:border-slate-600 transition"
+            >
+              <!-- Thumbnail Preview -->
+              <div class="w-10 h-10 rounded bg-black/50 border border-slate-700/80 flex items-center justify-center overflow-hidden flex-shrink-0">
+                <img 
+                  v-if="customAvatarPack[item.key]" 
+                  :src="customAvatarPack[item.key]" 
+                  class="w-full h-full object-contain"
+                />
+                <span v-else class="text-[12px] opacity-30 select-none">🖼️</span>
+              </div>
+
+              <!-- Metadata & Tombol Upload -->
+              <div class="flex-1 min-w-0">
+                <div class="text-[9px] font-bold text-slate-200 truncate">{{ item.label }}</div>
+                <div class="text-[8px] text-slate-400 truncate">{{ item.desc }}</div>
+                <div class="flex items-center gap-1 mt-1">
+                  <label class="cursor-pointer bg-slate-700 hover:bg-slate-600 text-slate-200 text-[8px] font-semibold px-1.5 py-0.5 rounded transition">
+                    Upload
+                    <input type="file" accept="image/png,image/webp,image/jpeg,image/svg+xml" class="hidden" @change="e => handleSpriteUpload(e, item.key)" />
+                  </label>
+                  <button 
+                    v-if="customAvatarPack[item.key]"
+                    @click="removeSingleSprite(item.key)"
+                    title="Hapus sprite frame ini"
+                    class="text-rose-400 hover:text-rose-300 text-[8px] px-1 font-bold"
+                  >
+                    ✕
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Tombol Simpan & Tutup -->
+        <div class="flex gap-2 mt-1">
+          <button 
+            @click="saveSettings" 
+            :disabled="isSavingConfig"
+            class="flex-1 bg-sky-600 hover:bg-sky-500 text-white font-bold py-1 rounded text-[10px] transition"
+          >
+            {{ isSavingConfig ? 'Menyimpan...' : 'Simpan Pengaturan' }}
+          </button>
+          <button 
+            @click="showSettings = false"
+            class="px-3 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded text-[10px]"
+          >
+            Tutup
+          </button>
+        </div>
+      </div>
+
+      <!-- ── Balon Dialog RPG ── -->
+      <div v-else class="w-full bg-slate-900/90 backdrop-blur-md border border-slate-700/80 rounded-2xl p-3 shadow-xl text-slate-100">
+
+        <!-- Header: Status + Tombol Kontrol -->
+        <div
+          @mousedown="startDrag"
+          class="flex items-center justify-between border-b border-slate-800 pb-1.5 mb-2 cursor-move"
+        >
+          <div class="flex items-center gap-1.5">
+            <span class="w-2 h-2 rounded-full shadow-sm" :class="stateBadgeColor" />
+            <span class="text-[10px] font-bold uppercase tracking-widest text-slate-400">
+              Aoi • {{ stateLabel }}
+            </span>
+          </div>
+          <div class="flex items-center gap-1">
+            <button
+              @click.stop="openSettings"
+              title="Pengaturan API & Model"
+              class="text-[10px] px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300"
+            >⚙️</button>
+            <button
+              @click.stop="ghostMode = !ghostMode"
+              title="Ghost Mode"
+              class="text-[10px] px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300"
+            >👻</button>
+            <button
+              @click.stop="toggleMinimize"
+              title="Minimize (Super+H)"
+              class="text-[10px] px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300"
+            >_</button>
+          </div>
+        </div>
+
+        <!-- Teks pesan AI -->
+        <p class="text-xs leading-relaxed text-slate-200 min-h-[2rem] break-words whitespace-pre-wrap">
+          {{ message }}
+        </p>
+
+        <!-- Thinking spinner -->
+        <div v-if="currentState === 'thinking'" class="flex items-center gap-1.5 mt-1.5">
+          <span class="w-1.5 h-1.5 rounded-full bg-amber-400 animate-bounce" style="animation-delay:0ms" />
+          <span class="w-1.5 h-1.5 rounded-full bg-amber-400 animate-bounce" style="animation-delay:150ms" />
+          <span class="w-1.5 h-1.5 rounded-full bg-amber-400 animate-bounce" style="animation-delay:300ms" />
+        </div>
+
+        <!-- ── Konfirmasi Red Tier ── -->
+        <div
+          v-if="currentState === 'confirm' && pendingCommand"
+          class="mt-2.5 p-2 rounded-lg bg-slate-950/90 border border-purple-500/40"
+        >
+          <div class="text-[10px] text-purple-300 font-semibold mb-1">⚠️ Konfirmasi Perintah Terminal:</div>
+          <code class="block text-[11px] font-mono text-emerald-400 bg-black/50 px-2 py-1 rounded break-all">
+            $ {{ pendingCommand }}
+          </code>
+          <div class="flex gap-2 mt-2">
+            <button
+              @click="triggerState('speaking', 'Menjalankan: ' + pendingCommand)"
+              class="flex-1 bg-emerald-600 hover:bg-emerald-500 text-white text-[10px] font-bold py-1 rounded transition"
+            >[Alt+Y] Setuju</button>
+            <button
+              @click="triggerState('idle', 'Perintah dibatalkan.')"
+              class="flex-1 bg-rose-600/80 hover:bg-rose-600 text-white text-[10px] font-bold py-1 rounded transition"
+            >[Alt+N] Batal</button>
+          </div>
+        </div>
+
+        <!-- ── Chat input bar & Tombol Mic ── -->
+        <div class="flex gap-1.5 mt-2.5">
+          <button
+            @click="toggleMic"
+            :title="currentState === 'listening' ? 'Hentikan & Proses Suara' : 'Mulai Bicara (Super+V)'"
+            class="px-2.5 py-1.5 rounded-lg border text-[11px] font-bold transition flex items-center justify-center"
+            :class="currentState === 'listening' ? 'bg-emerald-600 border-emerald-400 text-white animate-pulse' : 'bg-slate-800 border-slate-700 text-slate-300 hover:bg-slate-700'"
+          >
+            🎙️
+          </button>
+          <input
+            v-model="chatInput"
+            @keydown="handleChatKeydown"
+            :disabled="isSendingChat || currentState === 'thinking'"
+            placeholder="Ketik pesan... (Enter untuk kirim)"
+            class="flex-1 text-[11px] bg-slate-800/80 border border-slate-700 rounded-lg px-2.5 py-1.5 text-slate-200 placeholder-slate-500 outline-none focus:border-sky-500/70 transition disabled:opacity-50"
+          />
+          <button
+            @click="sendChat"
+            :disabled="isSendingChat || !chatInput.trim() || currentState === 'thinking'"
+            class="px-2.5 py-1.5 rounded-lg bg-sky-600 hover:bg-sky-500 disabled:opacity-40 text-white text-[11px] font-bold transition"
+          >
+            <span v-if="isSendingChat">⏳</span>
+            <span v-else>➤</span>
+          </button>
+        </div>
+      </div>
+
+      <!-- ── Sprite Avatar 2D ── -->
+      <div
+        @mousedown="startDrag"
+        class="relative w-44 h-44 flex items-center justify-center cursor-move"
+      >
+        <!-- Custom PNG/WebP -->
+        <img
+          v-if="activeCustomFrame"
+          :src="activeCustomFrame"
+          alt="Aoi Avatar"
+          class="w-full h-full object-contain pointer-events-none select-none drop-shadow-2xl"
+        />
+
+        <!-- Built-in SVG chibi -->
+        <svg
+          v-else
+          viewBox="0 0 200 200"
+          class="w-full h-full drop-shadow-xl transition-transform duration-200"
+          :class="{
+            'scale-105': currentState === 'listening',
+            'translate-y-[-2px]': currentState === 'speaking' && isMouthOpen
+          }"
+        >
+          <!-- Aura sesuai state -->
+          <circle
+            cx="100" cy="105" r="72"
+            class="transition-colors duration-500"
+            :fill="currentState === 'listening' ? 'rgba(16,185,129,0.22)'
+                 : currentState === 'thinking'  ? 'rgba(245,158,11,0.22)'
+                 : currentState === 'error'      ? 'rgba(244,63,94,0.25)'
+                 : currentState === 'confirm'    ? 'rgba(168,85,247,0.20)'
+                 : 'rgba(56,189,248,0.12)'"
+          />
+
+          <!-- Rambut belakang -->
+          <path d="M45 90 Q35 150 55 175 L145 175 Q165 150 155 90 Z" fill="#312e81"/>
+
+          <!-- Tubuh / hoodie -->
+          <path d="M60 150 Q100 140 140 150 L150 190 L50 190 Z" fill="#4f46e5"/>
+          <path d="M85 150 L100 175 L115 150" fill="#e0e7ff"/>
+
+          <!-- Wajah -->
+          <circle cx="100" cy="102" r="46" fill="#ffedd5"/>
+
+          <!-- Rambut depan / poni -->
+          <path d="M52 95 Q55 50 100 50 Q145 50 148 95 Q130 70 115 90 Q100 68 85 90 Q70 70 52 95 Z" fill="#4338ca"/>
+
+          <!-- Telinga kucing -->
+          <polygon points="55,68 42,40 75,55" fill="#6366f1"/>
+          <polygon points="145,68 158,40 125,55" fill="#6366f1"/>
+
+          <!-- MATA -->
+          <!-- Error: X X -->
+          <g v-if="currentState === 'error'" stroke="#e11d48" stroke-width="3.5" stroke-linecap="round">
+            <line x1="72" y1="96" x2="86" y2="110"/>
+            <line x1="86" y1="96" x2="72" y2="110"/>
+            <line x1="114" y1="96" x2="128" y2="110"/>
+            <line x1="128" y1="96" x2="114" y2="110"/>
+          </g>
+          <!-- Berkedip -->
+          <g v-else-if="isBlinking" stroke="#1e1b4b" stroke-width="3" fill="none" stroke-linecap="round">
+            <path d="M70 104 Q79 110 88 104"/>
+            <path d="M112 104 Q121 110 130 104"/>
+          </g>
+          <!-- Thinking: mata naik ke atas -->
+          <g v-else-if="currentState === 'thinking'">
+            <ellipse cx="79" cy="100" rx="7" ry="8" fill="#1e1b4b"/>
+            <ellipse cx="121" cy="100" rx="7" ry="8" fill="#1e1b4b"/>
+            <circle cx="79" cy="96" r="3" fill="#fff"/>
+            <circle cx="121" cy="96" r="3" fill="#fff"/>
+          </g>
+          <!-- Normal -->
+          <g v-else>
+            <ellipse cx="79" cy="103" rx="7.5" ry="9" fill="#1e1b4b"/>
+            <ellipse cx="121" cy="103" rx="7.5" ry="9" fill="#1e1b4b"/>
+            <circle cx="76" cy="99" r="3" fill="#fff"/>
+            <circle cx="118" cy="99" r="3" fill="#fff"/>
+          </g>
+
+          <!-- Pipi -->
+          <ellipse cx="66" cy="115" rx="6" ry="3" fill="#fda4af" opacity="0.7"/>
+          <ellipse cx="134" cy="115" rx="6" ry="3" fill="#fda4af" opacity="0.7"/>
+
+          <!-- MULUT -->
+          <ellipse
+            v-if="currentState === 'speaking' && isMouthOpen"
+            cx="100" cy="124" rx="7" ry="6" fill="#f43f5e"
+          />
+          <ellipse
+            v-else-if="currentState === 'error' || currentState === 'confirm'"
+            cx="100" cy="125" rx="5" ry="5" fill="none" stroke="#1e1b4b" stroke-width="2.5"
+          />
+          <path
+            v-else
+            d="M93 122 Q100 128 107 122"
+            fill="none" stroke="#1e1b4b" stroke-width="2.5" stroke-linecap="round"
+          />
+
+          <!-- Ikon Mic Listening -->
+          <g v-if="currentState === 'listening'">
+            <circle cx="155" cy="65" r="14" fill="#10b981"/>
+            <rect x="151" y="56" width="8" height="12" rx="4" fill="white"/>
+            <path d="M148 64 Q155 73 162 64" fill="none" stroke="white" stroke-width="2"/>
+          </g>
+
+          <!-- Balon pikiran Thinking -->
+          <g v-if="currentState === 'thinking'">
+            <circle cx="152" cy="75" r="4" fill="#fbbf24"/>
+            <circle cx="162" cy="63" r="6" fill="#fbbf24"/>
+            <circle cx="172" cy="48" r="10" fill="#fbbf24"/>
+          </g>
+
+          <!-- Tanda seru Error -->
+          <g v-if="currentState === 'error'">
+            <circle cx="155" cy="55" r="14" fill="#f43f5e"/>
+            <text x="155" y="61" text-anchor="middle" font-size="16" fill="white" font-weight="bold">!</text>
+          </g>
+        </svg>
+      </div>
+
+      <!-- ── Dev Toolbar (klik kanan untuk sembunyikan) ── -->
+      <div
+        v-if="showDevToolbar"
+        class="w-full bg-slate-900/95 border border-slate-700/80 rounded-xl p-2 shadow-lg"
+      >
+        <div class="text-[9px] text-slate-400 text-center mb-1.5">
+          🛠️ Dev Panel — Klik Kanan Avatar untuk Sembunyikan
+        </div>
+        <div class="grid grid-cols-3 gap-1">
+          <button @click="triggerState('idle','Standby... Tekan Super+V untuk bicara.')"
+            class="text-[10px] py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-200">Idle</button>
+          <button @click="triggerState('listening','Mendengarkan suaramu...')"
+            class="text-[10px] py-1 rounded bg-emerald-900/60 hover:bg-emerald-800 text-emerald-200">Listening</button>
+          <button @click="triggerState('thinking','Sedang memikirkan jawaban...')"
+            class="text-[10px] py-1 rounded bg-amber-900/60 hover:bg-amber-800 text-amber-200">Thinking</button>
+          <button @click="triggerState('speaking','Halo! Aku sedang berbicara dengan lip-sync!')"
+            class="text-[10px] py-1 rounded bg-sky-900/60 hover:bg-sky-800 text-sky-200">Speaking</button>
+          <button @click="triggerState('confirm','Izinkan saya menghapus cache paket?','sudo pacman -Scc')"
+            class="text-[10px] py-1 rounded bg-purple-900/60 hover:bg-purple-800 text-purple-200">Confirm</button>
+          <button @click="triggerState('error','Waduh! Koneksi ke server LLM terputus.')"
+            class="text-[10px] py-1 rounded bg-rose-900/60 hover:bg-rose-800 text-rose-200">Error</button>
+        </div>
+      </div>
+
+    </div>
+  </div>
+</template>
+
+<style>
+html, body, #app {
+  background: transparent !important;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+  font-family: 'Inter', 'Noto Sans', system-ui, sans-serif;
+}
+</style>

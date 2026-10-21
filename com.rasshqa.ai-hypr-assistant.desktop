@@ -1,0 +1,12 @@
+[Desktop Entry]
+Name=Aoi (AI Hypr-Assistant)
+GenericName=AI Desktop Companion
+Comment=Super lightweight 2D anime AI desktop companion for CachyOS / Arch Linux (Hyprland)
+Exec=ai-hypr-assistant
+Icon=ai-hypr-assistant
+Terminal=false
+Type=Application
+Categories=Utility;ArtificialIntelligence;AudioVideo;
+StartupNotify=false
+Keywords=ai;waifu;assistant;hyprland;wayland;cachyos;
+X-GNOME-Autostart-enabled=true
