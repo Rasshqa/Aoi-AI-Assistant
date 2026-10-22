@@ -11,6 +11,7 @@ mod tts;
 pub mod config;
 pub mod stt;
 pub mod avatar;
+pub mod voice_clone;
 
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -60,6 +61,8 @@ pub fn run() {
     let chat_memory: Arc<Mutex<ConversationMemory>> =
         Arc::new(Mutex::new(ConversationMemory::new()));
 
+
+
     tauri::Builder::default()
         .manage(AppState(initial_state.clone()))
         .manage(TtsPlayerState(tts_player.clone()))
@@ -71,7 +74,103 @@ pub fn run() {
             let tts_clone = tts_player.clone();
             let rec_clone = audio_recorder.clone();
 
+            if let Some(win) = tauri::Manager::get_webview_window(app, "main") {
+                println!(">>> WIN FOUND: {}", win.label());
+                let _ = win.set_visible_on_all_workspaces(true);
+                let _ = win.set_background_color(Some(tauri::window::Color(0, 0, 0, 0)));
+
+                #[cfg(target_os = "linux")]
+                {
+                    use gtk::prelude::*;
+                    use webkit2gtk::WebViewExt;
+
+                    if let Ok(gtk_win) = win.gtk_window() {
+                        gtk_win.set_decorated(false);
+                        gtk_win.set_border_width(0);
+                        gtk_win.set_app_paintable(true);
+                        if let Some(screen) = gtk::prelude::GtkWindowExt::screen(&gtk_win) {
+                            if let Some(visual) = screen.rgba_visual() {
+                                gtk_win.set_visual(Some(&visual));
+                            }
+                        }
+                        gtk_win.connect_draw(|win, cr| {
+                            cr.set_source_rgba(0.0, 0.0, 0.0, 0.0);
+                            cr.set_operator(gtk::cairo::Operator::Source);
+                            let _ = cr.paint();
+                            cr.set_operator(gtk::cairo::Operator::Over);
+                            for child in win.children() {
+                                win.propagate_draw(&child, cr);
+                            }
+                            gtk::glib::Propagation::Stop
+                        });
+
+                        let provider = gtk::CssProvider::new();
+                        let _ = provider.load_from_data(
+                            b"window, decoration, .background, .titlebar, headerbar, viewport, box, webview, widget, * {\n\
+                                background-color: transparent !important;\n\
+                                background: none !important;\n\
+                                border: none !important;\n\
+                                border-width: 0px !important;\n\
+                                box-shadow: none !important;\n\
+                                border-radius: 0px !important;\n\
+                                outline: none !important;\n\
+                                margin: 0px !important;\n\
+                                padding: 0px !important;\n\
+                            }\n"
+                        );
+                        gtk_win.style_context().add_provider(
+                            &provider,
+                            gtk::STYLE_PROVIDER_PRIORITY_USER,
+                        );
+                        if let Some(screen) = gtk::prelude::GtkWindowExt::screen(&gtk_win) {
+                            gtk::StyleContext::add_provider_for_screen(
+                                &screen,
+                                &provider,
+                                gtk::STYLE_PROVIDER_PRIORITY_USER,
+                            );
+                        }
+                    }
+
+                    let res = win.with_webview(|webview| {
+                        let wv = webview.inner();
+                        let rgba = gdk::RGBA::new(0.0, 0.0, 0.0, 0.0);
+                        println!(">>> SETTING WEBVIEW BG COLOR TO TRANSPARENT!");
+                        wv.set_background_color(&rgba);
+                    });
+                    println!(">>> WITH_WEBVIEW RESULT: {:?}", res);
+                }
+            }
+
             tauri::async_runtime::spawn(async move {
+                // Posisikan window di pojok kanan bawah monitor aktif Hyprland agar tidak menutupi tengah layar
+                tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+                if let Ok(output) = tokio::process::Command::new("hyprctl")
+                    .args(["monitors", "-j"])
+                    .output()
+                    .await
+                {
+                    if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&output.stdout) {
+                        if let Some(monitors) = json.as_array() {
+                            let focused = monitors.iter().find(|m| m["focused"].as_bool().unwrap_or(false))
+                                .or_else(|| monitors.first());
+                            if let Some(m) = focused {
+                                let w = m["width"].as_i64().unwrap_or(1920);
+                                let h = m["height"].as_i64().unwrap_or(1080);
+                                let target_x = (w - 170 - 20).max(0);
+                                let target_y = (h - 170 - 20).max(0);
+                                let dispatch_cmd = format!(
+                                    "hl.dsp.window.move({{ window = \"class:.*ai-hypr-assistant.*\", x = {}, y = {}, exact = true }})",
+                                    target_x, target_y
+                                );
+                                let _ = tokio::process::Command::new("hyprctl")
+                                    .args(["dispatch", &dispatch_cmd])
+                                    .output()
+                                    .await;
+                            }
+                        }
+                    }
+                }
+
                 // Broadcast state awal
                 broadcast_state(&handle, &state_clone).await;
                 // Jalankan IPC socket listener di background
@@ -98,6 +197,20 @@ pub fn run() {
             commands::confirm_pending_command,
             commands::cancel_pending_command,
             commands::clear_chat_memory,
+            commands::update_window_mode,
+            commands::list_avatar_presets,
+            commands::switch_avatar_preset,
+            commands::create_avatar_preset,
+            commands::delete_avatar_preset,
+            commands::import_avatar_preset_zip,
+            commands::export_avatar_preset_zip,
+            commands::test_tts_voice,
+            commands::list_cloned_voices,
+            commands::clone_voice_from_file,
+            commands::save_cloned_voice_manual,
+            commands::set_active_cloned_voice,
+            commands::delete_cloned_voice,
+            commands::get_cloned_voice_sample,
         ])
         .run(tauri::generate_context!())
         .expect("error saat menjalankan Aoi AI Assistant");

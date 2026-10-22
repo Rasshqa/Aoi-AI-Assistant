@@ -20,6 +20,7 @@ use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 
 use crate::broadcast_state;
+use crate::config::AppConfig;
 use crate::state::{AssistantState, StatePayload};
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -33,8 +34,11 @@ pub struct TtsPlayerState(pub Arc<Mutex<Option<Child>>>);
 // ────────────────────────────────────────────────────────────────────────────
 
 pub fn clean_text_for_tts(raw: &str) -> String {
+    // 0. Singkirkan tag thinking jika ada
+    let without_thinking = crate::commands::strip_thinking_tags(raw);
+
     // 1. Singkirkan baris BASH:
-    let without_bash = crate::bash_executor::strip_bash_command(raw);
+    let without_bash = crate::bash_executor::strip_bash_command(&without_thinking);
 
     // 2. Singkirkan blok kode ```...```
     let mut cleaned = String::new();
@@ -72,12 +76,24 @@ pub fn clean_text_for_tts(raw: &str) -> String {
 // Pencarian model Piper / Kokoro ONNX
 // ────────────────────────────────────────────────────────────────────────────
 
+pub fn expand_user_path(raw: &str) -> PathBuf {
+    let mut cleaned = raw.trim().trim_end_matches('.');
+    cleaned = cleaned.trim();
+    if cleaned.starts_with("~/") || cleaned == "~" {
+        if let Ok(home) = std::env::var("HOME") {
+            let sub = cleaned.strip_prefix("~/").unwrap_or("");
+            return PathBuf::from(home).join(sub);
+        }
+    }
+    PathBuf::from(cleaned)
+}
+
 /// Cari file model .onnx dari berbagai lokasi umum
 pub fn find_piper_model() -> Option<PathBuf> {
     // 1. Cek path kustom dari ~/.config/aoi/config.json
     let cfg = crate::config::load_config();
     if !cfg.tts_model_path.trim().is_empty() {
-        let p = PathBuf::from(cfg.tts_model_path.trim());
+        let p = expand_user_path(&cfg.tts_model_path);
         if p.exists() {
             return Some(p);
         }
@@ -85,7 +101,7 @@ pub fn find_piper_model() -> Option<PathBuf> {
 
     // 2. Override via environment variable
     if let Ok(model) = std::env::var("AOI_TTS_MODEL") {
-        let p = PathBuf::from(&model);
+        let p = expand_user_path(&model);
         if p.exists() {
             return Some(p);
         }
@@ -202,25 +218,10 @@ pub async fn speak(
 ) {
     let wav_path = "/tmp/aoi_tts.wav";
     let cleaned = clean_text_for_tts(&text);
+    let config = crate::config::load_config();
 
-    // ── 1. Cari model dan binary engine
-    let model = find_piper_model();
-
-    if model.is_none() {
-        eprintln!(
-            "ℹ️ Info: Model Piper belum ditemukan di ~/.local/share/piper/*.onnx\n\
-             Menjalankan simulated lip-sync berdasarkan panjang kalimat.\n\
-             Untuk mengaktifkan suara: yay -S piper-tts-bin dan unduh model onnx."
-        );
-        // Simulasi lip-sync cerdas agar visual tetap berbicara natural
-        simulate_speech(&cleaned, &app, &assistant_state, &player_state).await;
-        return;
-    }
-
-    let model_path = model.unwrap();
-
-    // ── 2. Generate WAV via piper
-    if let Err(e) = generate_wav(&cleaned, &model_path, wav_path).await {
+    // ── 1. Sintesis audio sesuai engine yang aktif (Edge-TTS, ElevenLabs, OpenAI Speech, atau Piper)
+    if let Err(e) = synthesize_speech(&cleaned, &config, wav_path).await {
         eprintln!("TTS synthesis gagal ({}), beralih ke simulated lip-sync.", e);
         simulate_speech(&cleaned, &app, &assistant_state, &player_state).await;
         return;
@@ -339,18 +340,317 @@ async fn finish_speech(
     broadcast_state(app, assistant_state).await;
 }
 
+/// Dispatcher utama sintesis suara berdasarkan engine yang dipilih di konfigurasi
+pub async fn synthesize_speech(
+    text: &str,
+    config: &AppConfig,
+    wav_output: &str,
+) -> Result<(), String> {
+    match config.tts_engine.as_str() {
+        "edge_tts" => generate_edge_tts(text, config, wav_output).await,
+        "elevenlabs" => generate_elevenlabs(text, config, wav_output).await,
+        "fish_audio" => generate_fish_audio(text, config, wav_output).await,
+        "openai_speech" => generate_openai_speech(text, config, wav_output).await,
+        "piper" => {
+            let model = find_piper_model()
+                .ok_or_else(|| "Model Piper tidak ditemukan di ~/.local/share/piper/".to_string())?;
+            generate_wav(text, &model, wav_output).await
+        }
+        _ => {
+            // Default coba Edge-TTS terlebih dahulu, jika gagal coba Piper
+            if let Ok(()) = generate_edge_tts(text, config, wav_output).await {
+                Ok(())
+            } else if let Some(model) = find_piper_model() {
+                generate_wav(text, &model, wav_output).await
+            } else {
+                Err("Tidak ada TTS engine yang dapat digunakan.".into())
+            }
+        }
+    }
+}
+
+/// Sintesis vokal via Microsoft Edge-TTS (Natural, Ekspresif, Zero Local Overhead)
+async fn generate_edge_tts(
+    text: &str,
+    config: &AppConfig,
+    output_wav: &str,
+) -> Result<(), String> {
+    let local_bin = std::env::var("HOME")
+        .map(|h| PathBuf::from(h).join(".local/bin/edge-tts"))
+        .unwrap_or_default();
+
+    let bin = if which_exists("edge-tts").await {
+        PathBuf::from("edge-tts")
+    } else if local_bin.exists() {
+        local_bin
+    } else {
+        return Err("Binary edge-tts tidak ditemukan di PATH atau ~/.local/bin/edge-tts".into());
+    };
+
+    let mp3_path = "/tmp/aoi_edge_temp.mp3";
+    let voice = if config.edge_tts_voice.trim().is_empty() {
+        "id-ID-GadisNeural"
+    } else {
+        config.edge_tts_voice.trim()
+    };
+    let rate = if config.edge_tts_rate.trim().is_empty() {
+        "+10%"
+    } else {
+        config.edge_tts_rate.trim()
+    };
+
+    let status = Command::new(&bin)
+        .args([
+            "--voice",
+            voice,
+            "--rate",
+            rate,
+            "--text",
+            text,
+            "--write-media",
+            mp3_path,
+            "--no-progress",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .map_err(|e| format!("Gagal menjalankan edge-tts: {}", e))?;
+
+    if !status.success() {
+        return Err("Proses edge-tts keluar dengan error".into());
+    }
+
+    convert_mp3_to_wav(mp3_path, output_wav).await
+}
+
+/// Sintesis vokal via ElevenLabs Voice Cloning API
+async fn generate_elevenlabs(
+    text: &str,
+    config: &AppConfig,
+    output_wav: &str,
+) -> Result<(), String> {
+    let voice_id = if !config.elevenlabs_voice_id.trim().is_empty() {
+        config.elevenlabs_voice_id.trim().to_string()
+    } else if !config.active_cloned_voice_id.is_empty() {
+        if let Ok(voices) = crate::voice_clone::list_cloned_voices() {
+            voices.into_iter()
+                .find(|v| v.id == config.active_cloned_voice_id)
+                .map(|v| v.remote_voice_id)
+                .unwrap_or_default()
+        } else {
+            String::new()
+        }
+    } else {
+        String::new()
+    };
+
+    if voice_id.is_empty() || config.elevenlabs_api_key.trim().is_empty() {
+        return Err("ElevenLabs API Key atau Voice ID belum dikonfigurasi di Pengaturan.".into());
+    }
+
+    let url = format!("https://api.elevenlabs.io/v1/text-to-speech/{}", voice_id);
+
+    let client = reqwest::Client::new();
+    let body = json!({
+        "text": text,
+        "model_id": "eleven_multilingual_v2",
+        "voice_settings": {
+            "stability": 0.5,
+            "similarity_boost": 0.8
+        }
+    });
+
+    let resp = client
+        .post(&url)
+        .header("xi-api-key", config.elevenlabs_api_key.trim())
+        .header("Content-Type", "application/json")
+        .header("Accept", "audio/mpeg")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("Request ke ElevenLabs gagal: {}", e))?;
+
+    if !resp.status().is_success() {
+        let err_text = resp.text().await.unwrap_or_default();
+        return Err(format!("ElevenLabs API Error: {}", err_text));
+    }
+
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| format!("Gagal membaca bytes dari ElevenLabs: {}", e))?;
+
+    let mp3_path = "/tmp/aoi_eleven_temp.mp3";
+    tokio::fs::write(mp3_path, &bytes)
+        .await
+        .map_err(|e| format!("Gagal menyimpan stream MP3 ElevenLabs: {}", e))?;
+
+    convert_mp3_to_wav(mp3_path, output_wav).await
+}
+
+/// Sintesis vokal via Fish Audio API (Zero-Shot Anime Voice Cloning)
+async fn generate_fish_audio(
+    text: &str,
+    config: &AppConfig,
+    output_wav: &str,
+) -> Result<(), String> {
+    if config.fish_audio_api_key.trim().is_empty() {
+        return Err("Fish Audio API Key belum dikonfigurasi di Pengaturan.".into());
+    }
+
+    let reference_id = if !config.active_cloned_voice_id.is_empty() {
+        if let Ok(voices) = crate::voice_clone::list_cloned_voices() {
+            voices.into_iter()
+                .find(|v| v.id == config.active_cloned_voice_id)
+                .map(|v| v.remote_voice_id)
+                .unwrap_or_default()
+        } else {
+            String::new()
+        }
+    } else {
+        String::new()
+    };
+
+    let client = reqwest::Client::new();
+    let mut body = json!({
+        "text": text,
+        "format": "mp3"
+    });
+
+    if !reference_id.trim().is_empty() {
+        body["reference_id"] = json!(reference_id.trim());
+    }
+
+    let resp = client
+        .post("https://api.fish.audio/v1/tts")
+        .header("Authorization", format!("Bearer {}", config.fish_audio_api_key.trim()))
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("Request ke Fish Audio gagal: {}", e))?;
+
+    if !resp.status().is_success() {
+        let err_text = resp.text().await.unwrap_or_default();
+        return Err(format!("Fish Audio API error: {}", err_text));
+    }
+
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| format!("Gagal membaca bytes dari Fish Audio: {}", e))?;
+
+    let mp3_path = "/tmp/aoi_fish_temp.mp3";
+    tokio::fs::write(mp3_path, &bytes)
+        .await
+        .map_err(|e| format!("Gagal menyimpan stream MP3 Fish Audio: {}", e))?;
+
+    convert_mp3_to_wav(mp3_path, output_wav).await
+}
+
+/// Sintesis vokal via OpenAI-Compatible Speech API (/v1/audio/speech)
+async fn generate_openai_speech(
+    text: &str,
+    config: &AppConfig,
+    output_wav: &str,
+) -> Result<(), String> {
+    let endpoint = if config.openai_speech_endpoint.trim().is_empty() {
+        "https://api.openai.com/v1/audio/speech"
+    } else {
+        config.openai_speech_endpoint.trim()
+    };
+
+    let client = reqwest::Client::new();
+    let voice = if config.openai_speech_voice.trim().is_empty() {
+        "nova"
+    } else {
+        config.openai_speech_voice.trim()
+    };
+
+    let body = json!({
+        "model": "tts-1",
+        "input": text,
+        "voice": voice
+    });
+
+    let mut req = client
+        .post(endpoint)
+        .header("Content-Type", "application/json")
+        .json(&body);
+
+    if !config.openai_speech_key.trim().is_empty() {
+        req = req.header("Authorization", format!("Bearer {}", config.openai_speech_key.trim()));
+    }
+
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| format!("Request OpenAI Speech gagal: {}", e))?;
+
+    if !resp.status().is_success() {
+        let err_text = resp.text().await.unwrap_or_default();
+        return Err(format!("OpenAI Speech Error: {}", err_text));
+    }
+
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| format!("Gagal membaca audio bytes: {}", e))?;
+
+    let mp3_path = "/tmp/aoi_openai_temp.mp3";
+    tokio::fs::write(mp3_path, &bytes)
+        .await
+        .map_err(|e| format!("Gagal menyimpan MP3 audio: {}", e))?;
+
+    convert_mp3_to_wav(mp3_path, output_wav).await
+}
+
+/// Konversi berkas audio MP3 ke WAV 22050Hz Mono menggunakan ffmpeg agar siap dianalisis RMS Lip-Sync
+async fn convert_mp3_to_wav(mp3_path: &str, wav_path: &str) -> Result<(), String> {
+    let status = Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-i",
+            mp3_path,
+            "-f",
+            "wav",
+            "-ar",
+            "22050",
+            "-ac",
+            "1",
+            wav_path,
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .map_err(|e| format!("Gagal menjalankan ffmpeg: {}", e))?;
+
+    if !status.success() {
+        return Err("Konversi format audio ffmpeg gagal".into());
+    }
+
+    Ok(())
+}
+
 /// Jalankan piper dengan teks dari stdin, output ke file WAV
 async fn generate_wav(text: &str, model: &PathBuf, output: &str) -> Result<(), String> {
-    // Coba binary 'piper' terlebih dahulu, lalu 'piper-tts'
+    let local_bin = std::env::var("HOME")
+        .map(|h| PathBuf::from(h).join(".local/bin/piper"))
+        .unwrap_or_default();
+
     let bin = if which_exists("piper").await {
-        "piper"
+        PathBuf::from("piper")
     } else if which_exists("piper-tts").await {
-        "piper-tts"
+        PathBuf::from("piper-tts")
+    } else if local_bin.exists() {
+        local_bin
     } else {
         return Err("Binary piper / piper-tts tidak ditemukan di PATH".into());
     };
 
-    let mut child = Command::new(bin)
+    let mut child = Command::new(&bin)
         .args([
             "--model",
             model.to_str().unwrap_or(""),
@@ -361,7 +661,7 @@ async fn generate_wav(text: &str, model: &PathBuf, output: &str) -> Result<(), S
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .map_err(|e| format!("Gagal menjalankan {}: {}", bin, e))?;
+        .map_err(|e| format!("Gagal menjalankan {}: {}", bin.display(), e))?;
 
     if let Some(mut stdin) = child.stdin.take() {
         stdin

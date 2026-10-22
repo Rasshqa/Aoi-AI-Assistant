@@ -184,6 +184,29 @@ async fn handle_command(
             broadcast_state(app, shared).await;
         }
 
+        _ if cmd.starts_with("chat:") => {
+            let user_text = cmd.trim_start_matches("chat:").trim().to_string();
+            if !user_text.is_empty() {
+                let app_clone = app.clone();
+                let shared_clone = shared.clone();
+                let tts_clone = tts_player.clone();
+                tokio::spawn(async move {
+                    println!("💬 Chat via socket diterima: {}", user_text);
+                    let res = commands::run_ai_pipeline(
+                        user_text,
+                        app_clone,
+                        shared_clone,
+                        tts_clone,
+                    )
+                    .await;
+                    match res {
+                        Ok(reply) => println!("💬 Balasan AI: {}", reply),
+                        Err(e) => eprintln!("❌ Error AI pipeline: {}", e),
+                    }
+                });
+            }
+        }
+
         _ => eprintln!("Perintah socket tidak dikenal: {}", cmd),
     }
 }

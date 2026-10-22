@@ -15,9 +15,9 @@
       {
         "label": "main",
         "title": "AI Waifu Overlay",
-        "width": 340,
-        "height": 480,
-        "resizable": false,
+        "width": 170,
+        "height": 170,
+        "resizable": true,
         "decorations": false,
         "transparent": true,
         "alwaysOnTop": true,

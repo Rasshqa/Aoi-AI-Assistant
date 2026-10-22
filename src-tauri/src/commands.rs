@@ -114,6 +114,119 @@ pub async fn reset_avatar_pack() -> Result<(), String> {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
+// Multi-Preset Avatar Commands
+// ────────────────────────────────────────────────────────────────────────────
+
+#[tauri::command]
+pub async fn list_avatar_presets() -> Result<Vec<crate::avatar::AvatarPresetMeta>, String> {
+    crate::avatar::list_avatar_presets()
+}
+
+#[tauri::command]
+pub async fn switch_avatar_preset(preset_id: String) -> Result<std::collections::HashMap<String, String>, String> {
+    crate::avatar::switch_avatar_preset(&preset_id)
+}
+
+#[tauri::command]
+pub async fn create_avatar_preset(name: String) -> Result<crate::avatar::AvatarPresetMeta, String> {
+    crate::avatar::create_avatar_preset(&name)
+}
+
+#[tauri::command]
+pub async fn delete_avatar_preset(preset_id: String) -> Result<(), String> {
+    crate::avatar::delete_avatar_preset(&preset_id)
+}
+
+#[tauri::command]
+pub async fn import_avatar_preset_zip(name: Option<String>, zip_base64: String) -> Result<crate::avatar::AvatarPresetMeta, String> {
+    crate::avatar::import_avatar_preset_zip(name, &zip_base64)
+}
+
+#[tauri::command]
+pub async fn export_avatar_preset_zip(preset_id: String) -> Result<String, String> {
+    crate::avatar::export_avatar_preset_zip(&preset_id)
+}
+
+#[tauri::command]
+pub async fn test_tts_voice(
+    sample_text: Option<String>,
+    app: AppHandle,
+    state: State<'_, AppState>,
+    tts_state: State<'_, TtsPlayerState>,
+) -> Result<(), String> {
+    let cfg = crate::config::load_config();
+    let text = sample_text.unwrap_or_else(|| {
+        format!("Halo {}! Aku {}, suara baruku sudah aktif dan siap membantumu.", cfg.user_name, cfg.assistant_name)
+    });
+
+    {
+        let mut s = state.0.lock().await;
+        s.state = AssistantState::Speaking;
+        s.message = text.clone();
+    }
+    broadcast_state(&app, &state.0).await;
+
+    let app_h = app.clone();
+    let s_clone = state.0.clone();
+    let t_clone = tts_state.0.clone();
+    tokio::spawn(async move {
+        tts::speak(text, app_h, s_clone, t_clone).await;
+    });
+
+    Ok(())
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Voice Cloning Studio Commands
+// ────────────────────────────────────────────────────────────────────────────
+
+#[tauri::command]
+pub async fn list_cloned_voices() -> Result<Vec<crate::voice_clone::ClonedVoiceMeta>, String> {
+    crate::voice_clone::list_cloned_voices()
+}
+
+#[tauri::command]
+pub async fn clone_voice_from_file(
+    name: String,
+    engine: String,
+    file_base64: String,
+    filename: String,
+    api_key: Option<String>,
+) -> Result<crate::voice_clone::ClonedVoiceMeta, String> {
+    crate::voice_clone::clone_voice_from_file(
+        &name,
+        &engine,
+        &file_base64,
+        &filename,
+        api_key.as_deref(),
+    ).await
+}
+
+#[tauri::command]
+pub async fn save_cloned_voice_manual(
+    name: String,
+    engine: String,
+    remote_voice_id: String,
+) -> Result<crate::voice_clone::ClonedVoiceMeta, String> {
+    crate::voice_clone::save_cloned_voice_manual(&name, &engine, &remote_voice_id)
+}
+
+#[tauri::command]
+pub async fn set_active_cloned_voice(voice_id: String) -> Result<(), String> {
+    crate::voice_clone::set_active_cloned_voice(&voice_id)
+}
+
+#[tauri::command]
+pub async fn delete_cloned_voice(voice_id: String) -> Result<(), String> {
+    crate::voice_clone::delete_cloned_voice(&voice_id)
+}
+
+#[tauri::command]
+pub async fn get_cloned_voice_sample(voice_id: String) -> Result<String, String> {
+    crate::voice_clone::get_cloned_voice_sample_base64(&voice_id)
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 // LLM Pipeline — shared antara chat input dan input suara STT
 // ────────────────────────────────────────────────────────────────────────────
 
@@ -145,13 +258,37 @@ pub async fn run_ai_pipeline(
     // ── 4. Konfigurasi LLM dari file config / env
     let config = build_llm_config();
 
-    let history = vec![llm_client::ChatMessage {
-        role: "user".into(),
-        content: enriched_message,
-    }];
+    // Gunakan tauri::Manager untuk mengambil MemoryState dari AppHandle
+    let history = {
+        use tauri::Manager;
+        let mem_state = app.state::<crate::MemoryState>();
+        let mut mem = mem_state.0.lock().await;
+        // Simpan pesan asli user ke memori
+        mem.push_user(user_message.clone());
+
+        // Salin seluruh history, lalu perkaya pesan terakhir dengan konteks Hyprland
+        let mut msgs = mem.messages().to_vec();
+        if let Some(last) = msgs.last_mut() {
+            last.content = enriched_message;
+        }
+        msgs
+    };
 
     // ── 5. Panggil LLM provider
-    let llm_result = llm_client::chat(&config, &history).await;
+    let llm_result = llm_client::chat(&config, &history)
+        .await
+        .map(|resp| strip_thinking_tags(&resp));
+
+    // Jika berhasil, simpan teks balasan bersih (tanpa tag BASH:) ke MemoryState
+    if let Ok(ref response_text) = llm_result {
+        use tauri::Manager;
+        let mem_state = app.state::<crate::MemoryState>();
+        let mut mem = mem_state.0.lock().await;
+        let clean_reply = bash_executor::strip_bash_command(response_text);
+        if !clean_reply.is_empty() {
+            mem.push_assistant(clean_reply);
+        }
+    }
 
     match llm_result {
         Err(e) => {
@@ -333,6 +470,89 @@ pub async fn execute_command(
     Ok(result)
 }
 
+#[tauri::command]
+pub async fn confirm_pending_command(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    tts_state: State<'_, TtsPlayerState>,
+) -> Result<(), String> {
+    let pending = {
+        let mut s = state.0.lock().await;
+        if s.state == AssistantState::Confirm {
+            let cmd = s.pending_command.take();
+            s.state = AssistantState::Thinking;
+            s.message = "⚡ Menjalankan perintah...".into();
+            cmd
+        } else {
+            None
+        }
+    };
+    broadcast_state(&app, &state.0).await;
+
+    if let Some(bash_cmd) = pending {
+        let result = bash_executor::execute_green(&bash_cmd).await;
+        let mut s = state.0.lock().await;
+        match result {
+            Ok(out) => {
+                let char_count = out.chars().count();
+                let trimmed = if char_count > 1500 {
+                    format!("{}...\n[Output dipotong]", out.chars().take(1500).collect::<String>())
+                } else {
+                    out.trim().to_string()
+                };
+                s.state = AssistantState::Speaking;
+                s.message = format!("✅ Selesai:\n```\n{}\n```", trimmed);
+                let app_h = app.clone();
+                let state_arc = state.0.clone();
+                let tts_arc = tts_state.0.clone();
+                tokio::spawn(async move {
+                    tts::speak("Perintah selesai dijalankan.".into(), app_h, state_arc, tts_arc).await;
+                });
+            }
+            Err(e) => {
+                s.state = AssistantState::Error;
+                s.message = format!("❌ Error: {}", e);
+            }
+        }
+        drop(s);
+        broadcast_state(&app, &state.0).await;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn cancel_pending_command(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    {
+        let mut s = state.0.lock().await;
+        if s.state == AssistantState::Confirm {
+            s.state = AssistantState::Idle;
+            s.pending_command = None;
+            s.message = "❌ Perintah dibatalkan oleh pengguna.".into();
+        }
+    }
+    broadcast_state(&app, &state.0).await;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn clear_chat_memory(
+    memory: State<'_, crate::MemoryState>,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    memory.0.lock().await.clear();
+    {
+        let mut s = state.0.lock().await;
+        s.state = AssistantState::Idle;
+        s.message = "🧹 Ingatan percakapan telah di-reset!".into();
+    }
+    broadcast_state(&app, &state.0).await;
+    Ok(())
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // Helper: Membangun LlmConfig dari config.json + env fallback
 // ────────────────────────────────────────────────────────────────────────────
@@ -395,7 +615,7 @@ pub fn build_llm_config() -> LlmConfig {
     };
 
     let model = if !cfg.model_name.is_empty() {
-        cfg.model_name
+        cfg.model_name.clone()
     } else {
         match provider {
             llm_client::LlmProvider::Gemini => "gemini-2.0-flash".into(),
@@ -412,20 +632,149 @@ pub fn build_llm_config() -> LlmConfig {
         }
     };
 
+    let system_prompt = build_system_prompt(&cfg);
+
     LlmConfig {
         provider,
         api_key,
         base_url,
         model,
-        system_prompt: concat!(
-            "Kamu adalah Aoi, asisten AI desktop pendamping bergaya anime yang ringan dan cerdas, ",
-            "berjalan di CachyOS (Arch Linux) dengan Hyprland Wayland compositor. ",
-            "Kamu membantu pengguna dengan tugas sehari-hari, coding, troubleshooting sistem Linux, ",
-            "dan administrasi Arch Linux. Jawab dengan ramah, ringkas, dan teknis jika diperlukan. ",
-            "Jika kamu perlu menjalankan perintah shell untuk membantu user, tuliskan di baris terpisah ",
-            "dengan format tepat: BASH:<perintah>\n",
-            "Contoh: BASH:ls -la ~/\n",
-            "Jangan pernah menambahkan penjelasan di dalam tag BASH, hanya perintahnya saja."
-        ).into(),
+        system_prompt,
     }
 }
+
+pub fn build_system_prompt(cfg: &config::AppConfig) -> String {
+    let assistant_name = if !cfg.assistant_name.trim().is_empty() {
+        cfg.assistant_name.trim()
+    } else {
+        "Aoi"
+    };
+
+    let user_name = if !cfg.user_name.trim().is_empty() {
+        cfg.user_name.trim()
+    } else {
+        "Kak"
+    };
+
+    let personality_desc = if !cfg.custom_personality.trim().is_empty() {
+        cfg.custom_personality.trim().to_string()
+    } else {
+        match cfg.personality_preset.as_str() {
+            "tsundere" => {
+                "Sifat: Tsundere imut. Sering gengsi, agak ketus di awal tapi sebenarnya sangat peduli, loyal, dan perhatian. \
+                 Gunakan ekspresi khas seperti 'Hmph!', 'B-bukan karena aku peduli ya!', tapi selalu siap membantu.".to_string()
+            }
+            "caring" => {
+                "Sifat: Lembut, dewasa, dan penuh perhatian (Onee-san / Pengayom). \
+                 Berbicara dengan nada menenangkan, hangat, menyemangati, dan sangat peduli pada kenyamanan pengguna.".to_string()
+            }
+            "cool" => {
+                "Sifat: Cool dan kalem (Kuudere). \
+                 Berbicara ringkas, nada tenang, tidak banyak basa-basi, sangat cerdas, elegan, dan selalu dapat diandalkan.".to_string()
+            }
+            _ => {
+                // "cheerful" (default)
+                "Sifat: Ceria, manis, dan bersemangat (Genki Waifu). \
+                 Gunakan gaya bahasa santai anak muda, ekspresif, hangat, ramah, dan menyenangkan didengar.".to_string()
+            }
+        }
+    };
+
+    format!(
+        "Kamu adalah {name}, asisten AI desktop pendamping virtual yang hidup di sistem CachyOS (Arch Linux) dengan Hyprland Wayland compositor.\n\
+         Lawan bicaramu adalah {user}. Selalu panggil dia dengan sebutan '{user}'.\n\n\
+         [KEPRIBADIAN & GAYA BICARA]\n\
+         {personality}\n\n\
+         [ATURAN PENTING GAYA JAWABAN - WAJIB PATUH]:\n\
+         1. SANGAT PENTING: JANGAN PANJANG-PANJANG! Jawabanmu langsung disuarakan lewat audio Text-to-Speech (TTS). Batasi jawaban obrolan antara 1 hingga 3 kalimat saja. Dilarang menulis esai atau paragraf panjang bertele-tele!\n\
+         2. MANUSIAWI & ALAMI: Bicaralah seperti teman dekat manusia dalam Bahasa Indonesia yang santai, luwes, dan hidup. Hindari gaya bahasa kaku formal buku atau robot customer care.\n\
+         3. PERINTAH TERMINAL: Jika {user} meminta perintah Linux/terminal atau kamu perlu memeriksa sistem, letakkan perintah di baris baru dengan format tepat: BASH:<perintah>\n\
+            Contoh: BASH:pactl set-sink-volume @DEFAULT_SINK@ +10%\n\
+            Jangan berikan penjelasan atau markdown di dalam baris BASH:, hanya perintah mentah.",
+        name = assistant_name,
+        user = user_name,
+        personality = personality_desc
+    )
+}
+
+pub fn strip_thinking_tags(raw: &str) -> String {
+    let mut text = raw.to_string();
+    while let Some(start) = text.find("<thinking>") {
+        if let Some(end) = text[start..].find("</thinking>") {
+            let actual_end = start + end + "</thinking>".len();
+            text.replace_range(start..actual_end, "");
+        } else {
+            text.truncate(start);
+            break;
+        }
+    }
+    if let Some(end) = text.find("</thinking>") {
+        text = text[end + "</thinking>".len()..].to_string();
+    }
+    text.trim().to_string()
+}
+
+#[tauri::command]
+pub async fn update_window_mode(
+    app: AppHandle,
+    expanded: bool,
+    avatar_size: u32,
+) -> Result<(), String> {
+    if let Some(win) = tauri::Manager::get_webview_window(&app, "main") {
+        let (target_w, target_h) = if expanded {
+            (360, 520)
+        } else {
+            let s = (avatar_size + 24).clamp(96, 320);
+            (s, s)
+        };
+
+        // Resize the Tauri window
+        let _ = win.set_size(tauri::Size::Logical(tauri::LogicalSize {
+            width: target_w as f64,
+            height: target_h as f64,
+        }));
+
+        #[cfg(target_os = "linux")]
+        {
+            use webkit2gtk::WebViewExt;
+            let _ = win.with_webview(|webview| {
+                let wv = webview.inner();
+                let rgba = gdk::RGBA::new(0.0, 0.0, 0.0, 0.0);
+                wv.set_background_color(&rgba);
+            });
+        }
+
+        // Adjust Hyprland position to keep the bottom-right corner anchored
+        #[cfg(target_os = "linux")]
+        {
+            if let Ok(output) = tokio::process::Command::new("hyprctl")
+                .args(["monitors", "-j"])
+                .output()
+                .await
+            {
+                if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&output.stdout) {
+                    if let Some(monitors) = json.as_array() {
+                        let focused = monitors.iter().find(|m| m["focused"].as_bool().unwrap_or(false))
+                            .or_else(|| monitors.first());
+                        if let Some(m) = focused {
+                            let w = m["width"].as_i64().unwrap_or(1920);
+                            let h = m["height"].as_i64().unwrap_or(1080);
+                            let target_x = (w - (target_w as i64) - 20).max(0);
+                            let target_y = (h - (target_h as i64) - 20).max(0);
+                            let dispatch_cmd = format!(
+                                "hl.dsp.window.move({{ window = \"class:.*ai-hypr-assistant.*\", x = {}, y = {}, exact = true }})",
+                                target_x, target_y
+                            );
+                            let _ = tokio::process::Command::new("hyprctl")
+                                .args(["dispatch", &dispatch_cmd])
+                                .output()
+                                .await;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+

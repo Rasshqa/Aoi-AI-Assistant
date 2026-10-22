@@ -4,6 +4,11 @@
   "description": "Capability untuk main window AI Hypr-Assistant (Aoi)",
   "windows": ["main"],
   "permissions": [
-    "core:default"
+    "core:default",
+    "core:window:allow-start-dragging",
+    "core:window:allow-hide",
+    "core:window:allow-show",
+    "core:window:allow-set-ignore-cursor-events",
+    "core:event:default"
   ]
 }

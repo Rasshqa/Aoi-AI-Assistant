@@ -137,7 +137,19 @@ async fn gemini_chat(config: &LlmConfig, history: &[ChatMessage]) -> Result<Stri
         return Err(format!("Gemini API error {}: {}", status, text));
     }
 
-    let json: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+    let raw_text = resp
+        .text()
+        .await
+        .map_err(|e| format!("Gagal baca body Gemini: {}", e))?;
+
+    let json: serde_json::Value = serde_json::from_str(&raw_text).map_err(|e| {
+        let preview = if raw_text.len() > 150 {
+            format!("{}...", &raw_text[..150])
+        } else {
+            raw_text.clone()
+        };
+        format!("Gagal parse JSON Gemini ({}): {}", e, preview)
+    })?;
 
     let text = json["candidates"][0]["content"]["parts"][0]["text"]
         .as_str()
@@ -152,7 +164,7 @@ async fn gemini_chat(config: &LlmConfig, history: &[ChatMessage]) -> Result<Stri
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// Provider: OpenAI-compatible (OpenAI / Groq / OpenRouter — format identik)
+// Provider: OpenAI-compatible (OpenAI / Groq / OpenRouter / Custom — format identik)
 // ────────────────────────────────────────────────────────────────────────────
 
 async fn openai_chat(config: &LlmConfig, history: &[ChatMessage]) -> Result<String, String> {
@@ -209,16 +221,64 @@ async fn openai_chat(config: &LlmConfig, history: &[ChatMessage]) -> Result<Stri
         return Err(format!("OpenAI API error {}: {}", status, text));
     }
 
-    let json: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
-    let text = json["choices"][0]["message"]["content"]
-        .as_str()
-        .unwrap_or("")
-        .to_string();
+    let raw_text = resp
+        .text()
+        .await
+        .map_err(|e| format!("Gagal membaca respons body: {}", e))?;
 
-    if text.is_empty() {
-        Err("Provider mengembalikan respons kosong".into())
-    } else {
-        Ok(text)
+    // 1. Dukungan Server-Sent Events (SSE Streaming: baris data: {"choices":[{"delta":...}]})
+    // Banyak server proxy / custom AI (Next.js AI SDK, LiteLLM, Ollama proxy) selalu mengirimkan format SSE
+    if raw_text.contains("data:") {
+        let mut full_text = String::new();
+        for line in raw_text.lines() {
+            let trimmed = line.trim();
+            if let Some(data_str) = trimmed.strip_prefix("data:") {
+                let data_str = data_str.trim();
+                if data_str == "[DONE]" || data_str.is_empty() {
+                    continue;
+                }
+                if let Ok(chunk) = serde_json::from_str::<serde_json::Value>(data_str) {
+                    if let Some(content) = chunk["choices"][0]["delta"]["content"].as_str() {
+                        full_text.push_str(content);
+                    } else if let Some(content) = chunk["choices"][0]["message"]["content"].as_str() {
+                        full_text.push_str(content);
+                    } else if let Some(text) = chunk["choices"][0]["text"].as_str() {
+                        full_text.push_str(text);
+                    }
+                }
+            }
+        }
+        if !full_text.is_empty() {
+            return Ok(full_text);
+        }
+    }
+
+    // 2. Parse sebagai JSON standar (Non-streaming)
+    match serde_json::from_str::<serde_json::Value>(&raw_text) {
+        Ok(json) => {
+            if let Some(content) = json["choices"][0]["message"]["content"].as_str() {
+                if !content.is_empty() {
+                    return Ok(content.to_string());
+                }
+            }
+            if let Some(text) = json["choices"][0]["text"].as_str() {
+                if !text.is_empty() {
+                    return Ok(text.to_string());
+                }
+            }
+            if let Some(err_msg) = json["error"]["message"].as_str() {
+                return Err(format!("Error dari API: {}", err_msg));
+            }
+            Err(format!("Format JSON response tidak dikenali: {}", raw_text))
+        }
+        Err(e) => {
+            let preview = if raw_text.len() > 150 {
+                format!("{}...", &raw_text[..150])
+            } else {
+                raw_text
+            };
+            Err(format!("Gagal parse respons JSON ({}): {}", e, preview))
+        }
     }
 }
 
@@ -269,7 +329,37 @@ async fn ollama_chat(config: &LlmConfig, history: &[ChatMessage]) -> Result<Stri
         return Err(format!("Ollama error {}: {}", status, text));
     }
 
-    let json: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+    let raw_text = resp
+        .text()
+        .await
+        .map_err(|e| format!("Gagal baca body Ollama: {}", e))?;
+
+    // Dukungan jika Ollama mengembalikan streaming NDJSON
+    let mut full_text = String::new();
+    for line in raw_text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Ok(chunk) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            if let Some(content) = chunk["message"]["content"].as_str() {
+                full_text.push_str(content);
+            }
+        }
+    }
+    if !full_text.is_empty() {
+        return Ok(full_text);
+    }
+
+    let json: serde_json::Value = serde_json::from_str(&raw_text).map_err(|e| {
+        let preview = if raw_text.len() > 150 {
+            format!("{}...", &raw_text[..150])
+        } else {
+            raw_text.clone()
+        };
+        format!("Gagal parse JSON Ollama ({}): {}", e, preview)
+    })?;
+
     let text = json["message"]["content"]
         .as_str()
         .unwrap_or("")

@@ -22,6 +22,8 @@ name = "ai-hypr-assistant"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "gdk",
+ "gtk",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
@@ -29,6 +31,7 @@ dependencies = [
  "tauri-build",
  "tokio",
  "tokio-util",
+ "webkit2gtk",
 ]
 
 [[package]]

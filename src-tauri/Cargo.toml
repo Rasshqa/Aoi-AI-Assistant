@@ -29,6 +29,11 @@ tokio-util = { version = "0.7", features = [] }
 # Base64 decoder untuk upload custom sprite avatar
 base64 = "0.22"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = "0.18"
+gdk = "0.18"
+webkit2gtk = "2.0"
+
 [profile.release]
 codegen-units = 1
 lto = true
