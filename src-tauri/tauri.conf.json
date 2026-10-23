@@ -15,8 +15,8 @@
       {
         "label": "main",
         "title": "AI Waifu Overlay",
-        "width": 170,
-        "height": 170,
+        "width": 320,
+        "height": 420,
         "resizable": true,
         "decorations": false,
         "transparent": true,
@@ -25,6 +25,20 @@
         "shadow": false,
         "x": 0,
         "y": 0
+      },
+      {
+        "label": "settings",
+        "title": "Pengaturan Aoi - AI Hypr-Assistant",
+        "url": "index.html",
+        "width": 840,
+        "height": 680,
+        "resizable": true,
+        "decorations": true,
+        "transparent": false,
+        "alwaysOnTop": false,
+        "skipTaskbar": false,
+        "visible": false,
+        "center": true
       }
     ],
     "security": {

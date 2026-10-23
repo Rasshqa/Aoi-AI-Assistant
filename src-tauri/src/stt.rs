@@ -144,23 +144,11 @@ pub async fn find_whisper_binary() -> Option<&'static str> {
     None
 }
 
-pub fn expand_user_path(raw: &str) -> PathBuf {
-    let mut cleaned = raw.trim().trim_end_matches('.');
-    cleaned = cleaned.trim();
-    if cleaned.starts_with("~/") || cleaned == "~" {
-        if let Ok(home) = std::env::var("HOME") {
-            let sub = cleaned.strip_prefix("~/").unwrap_or("");
-            return PathBuf::from(home).join(sub);
-        }
-    }
-    PathBuf::from(cleaned)
-}
-
 /// Cari model ggml whisper
 pub fn find_whisper_model(custom_path: &str) -> Option<PathBuf> {
     // 1. Path kustom dari config
     if !custom_path.is_empty() {
-        let p = expand_user_path(custom_path);
+        let p = crate::config::expand_user_path(custom_path);
         if p.exists() {
             return Some(p);
         }
@@ -168,7 +156,7 @@ pub fn find_whisper_model(custom_path: &str) -> Option<PathBuf> {
 
     // 2. Env variable
     if let Ok(env_p) = std::env::var("AOI_WHISPER_MODEL") {
-        let p = expand_user_path(&env_p);
+        let p = crate::config::expand_user_path(&env_p);
         if p.exists() {
             return Some(p);
         }

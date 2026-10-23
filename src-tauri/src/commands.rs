@@ -14,7 +14,7 @@
 
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, State, Emitter};
 
 use crate::state::{AppState, AssistantState, StatePayload};
 use crate::broadcast_state;
@@ -85,8 +85,10 @@ pub async fn get_config() -> Result<AppConfig, String> {
 }
 
 #[tauri::command]
-pub async fn save_config(cfg: AppConfig) -> Result<(), String> {
-    config::save_config(&cfg)
+pub async fn save_config(cfg: AppConfig, app: AppHandle) -> Result<(), String> {
+    config::save_config(&cfg)?;
+    let _ = app.emit("config-updated", &cfg);
+    Ok(())
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -94,8 +96,10 @@ pub async fn save_config(cfg: AppConfig) -> Result<(), String> {
 // ────────────────────────────────────────────────────────────────────────────
 
 #[tauri::command]
-pub async fn save_avatar_sprite(frame_name: String, data_url: String) -> Result<String, String> {
-    crate::avatar::save_avatar_sprite(&frame_name, &data_url)
+pub async fn save_avatar_sprite(frame_name: String, data_url: String, app: AppHandle) -> Result<String, String> {
+    let res = crate::avatar::save_avatar_sprite(&frame_name, &data_url)?;
+    let _ = app.emit("avatar-sprite-updated", serde_json::json!({ "frameKey": frame_name, "dataUrl": data_url }));
+    Ok(res)
 }
 
 #[tauri::command]
@@ -109,8 +113,10 @@ pub async fn load_avatar_pack(folder_override: Option<String>) -> Result<std::co
 }
 
 #[tauri::command]
-pub async fn reset_avatar_pack() -> Result<(), String> {
-    crate::avatar::reset_avatar_pack()
+pub async fn reset_avatar_pack(app: AppHandle) -> Result<(), String> {
+    crate::avatar::reset_avatar_pack()?;
+    let _ = app.emit("avatar-sprite-updated", serde_json::json!({ "reset": true }));
+    Ok(())
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -123,8 +129,10 @@ pub async fn list_avatar_presets() -> Result<Vec<crate::avatar::AvatarPresetMeta
 }
 
 #[tauri::command]
-pub async fn switch_avatar_preset(preset_id: String) -> Result<std::collections::HashMap<String, String>, String> {
-    crate::avatar::switch_avatar_preset(&preset_id)
+pub async fn switch_avatar_preset(preset_id: String, app: AppHandle) -> Result<std::collections::HashMap<String, String>, String> {
+    let pack = crate::avatar::switch_avatar_preset(&preset_id)?;
+    let _ = app.emit("avatar-preset-changed", serde_json::json!({ "presetId": preset_id, "pack": pack }));
+    Ok(pack)
 }
 
 #[tauri::command]
@@ -258,19 +266,16 @@ pub async fn run_ai_pipeline(
     // ── 4. Konfigurasi LLM dari file config / env
     let config = build_llm_config();
 
-    // Gunakan tauri::Manager untuk mengambil MemoryState dari AppHandle
+    // Bangun daftar pesan untuk dikirim ke LLM tanpa mengubah state memori permanen terlebih dahulu
     let history = {
         use tauri::Manager;
         let mem_state = app.state::<crate::MemoryState>();
-        let mut mem = mem_state.0.lock().await;
-        // Simpan pesan asli user ke memori
-        mem.push_user(user_message.clone());
-
-        // Salin seluruh history, lalu perkaya pesan terakhir dengan konteks Hyprland
+        let mem = mem_state.0.lock().await;
         let mut msgs = mem.messages().to_vec();
-        if let Some(last) = msgs.last_mut() {
-            last.content = enriched_message;
-        }
+        msgs.push(llm_client::ChatMessage {
+            role: "user".into(),
+            content: enriched_message,
+        });
         msgs
     };
 
@@ -279,14 +284,17 @@ pub async fn run_ai_pipeline(
         .await
         .map(|resp| strip_thinking_tags(&resp));
 
-    // Jika berhasil, simpan teks balasan bersih (tanpa tag BASH:) ke MemoryState
+    // Hanya simpan pasangan pesan user & assistant ke MemoryState jika panggilan LLM berhasil!
     if let Ok(ref response_text) = llm_result {
         use tauri::Manager;
         let mem_state = app.state::<crate::MemoryState>();
         let mut mem = mem_state.0.lock().await;
+        mem.push_user(user_message.clone());
         let clean_reply = bash_executor::strip_bash_command(response_text);
         if !clean_reply.is_empty() {
             mem.push_assistant(clean_reply);
+        } else {
+            mem.push_assistant("Perintah dijalankan.".into());
         }
     }
 
@@ -664,9 +672,9 @@ pub fn build_system_prompt(cfg: &config::AppConfig) -> String {
                 "Sifat: Tsundere imut. Sering gengsi, agak ketus di awal tapi sebenarnya sangat peduli, loyal, dan perhatian. \
                  Gunakan ekspresi khas seperti 'Hmph!', 'B-bukan karena aku peduli ya!', tapi selalu siap membantu.".to_string()
             }
-            "caring" => {
-                "Sifat: Lembut, dewasa, dan penuh perhatian (Onee-san / Pengayom). \
-                 Berbicara dengan nada menenangkan, hangat, menyemangati, dan sangat peduli pada kenyamanan pengguna.".to_string()
+            "mommy" | "caring" => {
+                "Sifat: Lembut, dewasa, tenang, dan penuh kasih sayang (Mommy / Onee-san). \
+                 Berbicara dengan nada menenangkan, hangat, mengayomi, menyemangati, dan sangat peduli pada kenyamanan pengguna.".to_string()
             }
             "cool" => {
                 "Sifat: Cool dan kalem (Kuudere). \
@@ -717,16 +725,12 @@ pub fn strip_thinking_tags(raw: &str) -> String {
 #[tauri::command]
 pub async fn update_window_mode(
     app: AppHandle,
-    expanded: bool,
+    _expanded: bool,
     avatar_size: u32,
 ) -> Result<(), String> {
     if let Some(win) = tauri::Manager::get_webview_window(&app, "main") {
-        let (target_w, target_h) = if expanded {
-            (360, 520)
-        } else {
-            let s = (avatar_size + 24).clamp(96, 320);
-            (s, s)
-        };
+        let target_w = avatar_size.clamp(120, 1200);
+        let target_h = ((target_w as f64) * 1.35) as u32;
 
         // Resize the Tauri window
         let _ = win.set_size(tauri::Size::Logical(tauri::LogicalSize {
@@ -743,38 +747,56 @@ pub async fn update_window_mode(
                 wv.set_background_color(&rgba);
             });
         }
-
-        // Adjust Hyprland position to keep the bottom-right corner anchored
-        #[cfg(target_os = "linux")]
-        {
-            if let Ok(output) = tokio::process::Command::new("hyprctl")
-                .args(["monitors", "-j"])
-                .output()
-                .await
-            {
-                if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&output.stdout) {
-                    if let Some(monitors) = json.as_array() {
-                        let focused = monitors.iter().find(|m| m["focused"].as_bool().unwrap_or(false))
-                            .or_else(|| monitors.first());
-                        if let Some(m) = focused {
-                            let w = m["width"].as_i64().unwrap_or(1920);
-                            let h = m["height"].as_i64().unwrap_or(1080);
-                            let target_x = (w - (target_w as i64) - 20).max(0);
-                            let target_y = (h - (target_h as i64) - 20).max(0);
-                            let dispatch_cmd = format!(
-                                "hl.dsp.window.move({{ window = \"class:.*ai-hypr-assistant.*\", x = {}, y = {}, exact = true }})",
-                                target_x, target_y
-                            );
-                            let _ = tokio::process::Command::new("hyprctl")
-                                .args(["dispatch", &dispatch_cmd])
-                                .output()
-                                .await;
-                        }
-                    }
-                }
-            }
-        }
     }
     Ok(())
+}
+
+#[tauri::command]
+pub async fn open_settings_window(app: AppHandle) -> Result<(), String> {
+    if let Some(win) = tauri::Manager::get_webview_window(&app, "settings") {
+        #[cfg(target_os = "linux")]
+        {
+            use webkit2gtk::WebViewExt;
+            let _ = win.with_webview(|webview| {
+                let wv = webview.inner();
+                let rgba = gdk::RGBA::new(9.0 / 255.0, 9.0 / 255.0, 11.0 / 255.0, 1.0);
+                wv.set_background_color(&rgba);
+            });
+        }
+        let _ = win.show();
+        let _ = win.unminimize();
+        let _ = win.set_focus();
+        Ok(())
+    } else {
+        let win = tauri::WebviewWindowBuilder::new(
+            &app,
+            "settings",
+            tauri::WebviewUrl::App("index.html".into()),
+        )
+        .title("Pengaturan Aoi - AI Hypr-Assistant")
+        .inner_size(840.0, 680.0)
+        .resizable(true)
+        .decorations(true)
+        .transparent(false)
+        .always_on_top(false)
+        .skip_taskbar(false)
+        .center()
+        .build()
+        .map_err(|e| e.to_string())?;
+
+        #[cfg(target_os = "linux")]
+        {
+            use webkit2gtk::WebViewExt;
+            let _ = win.with_webview(|webview| {
+                let wv = webview.inner();
+                let rgba = gdk::RGBA::new(9.0 / 255.0, 9.0 / 255.0, 11.0 / 255.0, 1.0);
+                wv.set_background_color(&rgba);
+            });
+        }
+
+        let _ = win.show();
+        let _ = win.set_focus();
+        Ok(())
+    }
 }
 

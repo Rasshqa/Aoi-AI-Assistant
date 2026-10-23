@@ -70,7 +70,7 @@ pub struct AppConfig {
 }
 
 fn default_tts_engine() -> String {
-    "edge_tts".to_string()
+    "piper".to_string()
 }
 
 fn default_edge_tts_voice() -> String {
@@ -102,11 +102,21 @@ fn default_user_name() -> String {
 }
 
 fn default_personality_preset() -> String {
-    "cheerful".to_string()
+    "caring".to_string()
 }
 
 impl Default for AppConfig {
     fn default() -> Self {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+        let default_piper_model = PathBuf::from(&home).join(".local/share/piper/mommy_lessac.onnx");
+        let initial_tts_model = std::env::var("AOI_TTS_MODEL").unwrap_or_else(|_| {
+            if default_piper_model.exists() {
+                default_piper_model.to_string_lossy().to_string()
+            } else {
+                String::new()
+            }
+        });
+
         Self {
             llm_provider: std::env::var("AOI_LLM_PROVIDER").unwrap_or_else(|_| "gemini".into()),
             gemini_api_key: std::env::var("GEMINI_API_KEY").unwrap_or_default(),
@@ -117,15 +127,15 @@ impl Default for AppConfig {
             custom_api_key: std::env::var("AOI_CUSTOM_API_KEY").unwrap_or_default(),
             custom_api_endpoint: std::env::var("AOI_CUSTOM_ENDPOINT").unwrap_or_default(),
             model_name: std::env::var("AOI_MODEL").unwrap_or_else(|_| "gemini-2.0-flash".into()),
-            tts_model_path: std::env::var("AOI_TTS_MODEL").unwrap_or_default(),
+            tts_model_path: initial_tts_model,
             whisper_model_path: std::env::var("AOI_WHISPER_MODEL").unwrap_or_default(),
             avatar_folder_path: String::new(),
             assistant_name: std::env::var("AOI_ASSISTANT_NAME").unwrap_or_else(|_| "Aoi".into()),
             user_name: std::env::var("AOI_USER_NAME").unwrap_or_else(|_| "Kak".into()),
-            personality_preset: std::env::var("AOI_PERSONALITY_PRESET").unwrap_or_else(|_| "cheerful".into()),
+            personality_preset: std::env::var("AOI_PERSONALITY_PRESET").unwrap_or_else(|_| "caring".into()),
             custom_personality: std::env::var("AOI_CUSTOM_PERSONALITY").unwrap_or_default(),
             avatar_size: 144,
-            tts_engine: "edge_tts".into(),
+            tts_engine: "piper".into(),
             edge_tts_voice: "id-ID-GadisNeural".into(),
             edge_tts_rate: "+10%".into(),
             elevenlabs_api_key: String::new(),
@@ -139,6 +149,18 @@ impl Default for AppConfig {
             colab_clone_endpoint: String::new(),
         }
     }
+}
+
+pub fn expand_user_path(raw: &str) -> PathBuf {
+    let mut cleaned = raw.trim().trim_end_matches('.');
+    cleaned = cleaned.trim();
+    if cleaned.starts_with("~/") || cleaned == "~" {
+        if let Ok(home) = std::env::var("HOME") {
+            let sub = cleaned.strip_prefix("~/").unwrap_or("");
+            return PathBuf::from(home).join(sub);
+        }
+    }
+    PathBuf::from(cleaned)
 }
 
 pub fn get_config_path() -> PathBuf {

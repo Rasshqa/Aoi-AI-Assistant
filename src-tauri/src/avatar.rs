@@ -330,22 +330,33 @@ pub fn export_avatar_preset_zip(preset_id: &str) -> Result<String, String> {
 
     let temp_zip_path = format!("/tmp/aoi_export_{}_{}.zip", preset_id, timestamp);
 
-    // Eksekusi zip command (-j = flatten paths)
+    // Kumpulkan semua file gambar frame yang ada di direktori preset
+    let mut files_to_zip: Vec<PathBuf> = Vec::new();
+    if let Ok(entries) = fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() {
+                if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                    if ["png", "webp", "jpg", "jpeg", "svg"].contains(&ext.to_lowercase().as_str()) {
+                        files_to_zip.push(path);
+                    }
+                }
+            }
+        }
+    }
+
+    if files_to_zip.is_empty() {
+        return Err("Tidak ada file gambar sprite di dalam preset ini untuk diekspor.".into());
+    }
+
     let status = Command::new("zip")
         .args(["-j", "-q", &temp_zip_path])
-        .args(
-            FRAME_NAMES
-                .iter()
-                .map(|f| format!("{}/{}*", dir.to_str().unwrap_or(""), f)),
-        )
-        .status();
+        .args(&files_to_zip)
+        .status()
+        .map_err(|e| format!("Gagal menjalankan perintah zip: {}", e))?;
 
-    if status.is_err() || !status.as_ref().unwrap().success() {
-        // Coba zip seluruh folder jika pattern di atas kosong
-        let _ = Command::new("zip")
-            .args(["-r", "-j", "-q", &temp_zip_path, dir.to_str().unwrap_or("")])
-            .status()
-            .map_err(|e| format!("Gagal membuat berkas zip: {}", e))?;
+    if !status.success() {
+        return Err("Proses pembuatan arsip ZIP gagal.".into());
     }
 
     let zip_bytes = fs::read(&temp_zip_path)
@@ -401,9 +412,23 @@ pub fn save_avatar_sprite(frame_name: &str, data_url: &str) -> Result<String, St
     fs::write(&file_path, bytes)
         .map_err(|e| format!("Gagal menulis file avatar {:?}: {}", file_path, e))?;
 
-    let mut manifest = load_manifest_map(&dir);
-    manifest.insert(frame_name.to_string(), data_url.to_string());
-    save_manifest_map(&dir, &manifest)?;
+    let mut manifest = load_preset_manifest(&dir);
+    if manifest.id.is_empty() {
+        manifest.id = dir
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+    }
+    if manifest.name.is_empty() {
+        manifest.name = if manifest.id == "custom_migrated" {
+            "Avatar Kustom Saya".to_string()
+        } else {
+            manifest.id.clone()
+        };
+    }
+    manifest.frames.insert(frame_name.to_string(), data_url.to_string());
+    save_preset_manifest(&dir, &manifest)?;
 
     Ok(data_url.to_string())
 }
@@ -504,21 +529,23 @@ fn load_manifest_map(dir: &Path) -> HashMap<String, String> {
     HashMap::new()
 }
 
-fn save_manifest_map(dir: &Path, map: &HashMap<String, String>) -> Result<(), String> {
-    let path = dir.join("manifest.json");
-    let json_str = serde_json::to_string_pretty(map)
-        .map_err(|e| format!("Gagal serialisasi manifest: {}", e))?;
-    fs::write(&path, json_str)
-        .map_err(|e| format!("Gagal menulis manifest: {}", e))?;
-    Ok(())
-}
-
 fn load_preset_manifest(dir: &Path) -> PresetManifest {
     let path = dir.join("manifest.json");
     if path.exists() {
         if let Ok(content) = fs::read_to_string(&path) {
             if let Ok(m) = serde_json::from_str::<PresetManifest>(&content) {
-                return m;
+                if !m.id.is_empty() || !m.name.is_empty() || !m.frames.is_empty() {
+                    return m;
+                }
+            }
+            if let Ok(frames) = serde_json::from_str::<HashMap<String, String>>(&content) {
+                let folder_id = dir.file_name().unwrap_or_default().to_string_lossy().to_string();
+                return PresetManifest {
+                    id: folder_id.clone(),
+                    name: folder_id,
+                    author: "User".to_string(),
+                    frames,
+                };
             }
         }
     }

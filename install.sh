@@ -17,8 +17,15 @@ echo "🌸 Menyiapkan Aoi (AI Hypr-Assistant)..."
 mkdir -p "$CONFIG_DIR"
 mkdir -p "$DESKTOP_DIR"
 mkdir -p "$HOME/.local/bin"
+mkdir -p "$HOME/.local/share/icons/hicolor/512x512/apps"
+mkdir -p "$HOME/.local/share/pixmaps"
 
-# 2. Pasang .desktop launcher
+# 2. Pasang icon aplikasi & .desktop launcher
+if [ -f "$PROJECT_DIR/public/Aoi.png" ]; then
+    cp "$PROJECT_DIR/public/Aoi.png" "$HOME/.local/share/icons/hicolor/512x512/apps/ai-hypr-assistant.png"
+    cp "$PROJECT_DIR/public/Aoi.png" "$HOME/.local/share/pixmaps/ai-hypr-assistant.png"
+    echo "✅ Ikon aplikasi dipasang di ~/.local/share/icons & ~/.local/share/pixmaps"
+fi
 cp "$PROJECT_DIR/com.rasshqa.ai-hypr-assistant.desktop" "$DESKTOP_DIR/"
 
 # 3. Buat symlink binary ke ~/.local/bin jika sudah di-build

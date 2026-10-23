@@ -22,3 +22,9 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Knowledge graph and AI agent artifacts
+graphify-out/
+anti-slop/
+.agents/
+*.audit.md

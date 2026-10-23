@@ -1,1 +1,10 @@
 @import "tailwindcss";
+
+:root,
+html,
+body,
+#app {
+  background: transparent !important;
+  background-color: transparent !important;
+}
+

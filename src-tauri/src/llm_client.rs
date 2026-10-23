@@ -56,6 +56,16 @@ impl Default for LlmConfig {
     }
 }
 
+fn safe_preview(text: &str, max_chars: usize) -> String {
+    let count = text.chars().count();
+    if count > max_chars {
+        let truncated: String = text.chars().take(max_chars).collect();
+        format!("{}...", truncated)
+    } else {
+        text.to_string()
+    }
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // Shared HTTP client (lazy-init via std::sync::OnceLock)
 // ────────────────────────────────────────────────────────────────────────────
@@ -143,11 +153,7 @@ async fn gemini_chat(config: &LlmConfig, history: &[ChatMessage]) -> Result<Stri
         .map_err(|e| format!("Gagal baca body Gemini: {}", e))?;
 
     let json: serde_json::Value = serde_json::from_str(&raw_text).map_err(|e| {
-        let preview = if raw_text.len() > 150 {
-            format!("{}...", &raw_text[..150])
-        } else {
-            raw_text.clone()
-        };
+        let preview = safe_preview(&raw_text, 150);
         format!("Gagal parse JSON Gemini ({}): {}", e, preview)
     })?;
 
@@ -272,11 +278,7 @@ async fn openai_chat(config: &LlmConfig, history: &[ChatMessage]) -> Result<Stri
             Err(format!("Format JSON response tidak dikenali: {}", raw_text))
         }
         Err(e) => {
-            let preview = if raw_text.len() > 150 {
-                format!("{}...", &raw_text[..150])
-            } else {
-                raw_text
-            };
+            let preview = safe_preview(&raw_text, 150);
             Err(format!("Gagal parse respons JSON ({}): {}", e, preview))
         }
     }
@@ -352,11 +354,7 @@ async fn ollama_chat(config: &LlmConfig, history: &[ChatMessage]) -> Result<Stri
     }
 
     let json: serde_json::Value = serde_json::from_str(&raw_text).map_err(|e| {
-        let preview = if raw_text.len() > 150 {
-            format!("{}...", &raw_text[..150])
-        } else {
-            raw_text.clone()
-        };
+        let preview = safe_preview(&raw_text, 150);
         format!("Gagal parse JSON Ollama ({}): {}", e, preview)
     })?;
 

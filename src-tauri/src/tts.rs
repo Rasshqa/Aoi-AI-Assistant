@@ -76,24 +76,12 @@ pub fn clean_text_for_tts(raw: &str) -> String {
 // Pencarian model Piper / Kokoro ONNX
 // ────────────────────────────────────────────────────────────────────────────
 
-pub fn expand_user_path(raw: &str) -> PathBuf {
-    let mut cleaned = raw.trim().trim_end_matches('.');
-    cleaned = cleaned.trim();
-    if cleaned.starts_with("~/") || cleaned == "~" {
-        if let Ok(home) = std::env::var("HOME") {
-            let sub = cleaned.strip_prefix("~/").unwrap_or("");
-            return PathBuf::from(home).join(sub);
-        }
-    }
-    PathBuf::from(cleaned)
-}
-
 /// Cari file model .onnx dari berbagai lokasi umum
 pub fn find_piper_model() -> Option<PathBuf> {
     // 1. Cek path kustom dari ~/.config/aoi/config.json
     let cfg = crate::config::load_config();
     if !cfg.tts_model_path.trim().is_empty() {
-        let p = expand_user_path(&cfg.tts_model_path);
+        let p = crate::config::expand_user_path(&cfg.tts_model_path);
         if p.exists() {
             return Some(p);
         }
@@ -101,13 +89,21 @@ pub fn find_piper_model() -> Option<PathBuf> {
 
     // 2. Override via environment variable
     if let Ok(model) = std::env::var("AOI_TTS_MODEL") {
-        let p = expand_user_path(&model);
+        let p = crate::config::expand_user_path(&model);
         if p.exists() {
             return Some(p);
         }
     }
 
-    // 3. ~/.local/share/piper/*.onnx & ~/.local/share/kokoro/*.onnx
+    // 3. Cek spesifik mommy_lessac.onnx di ~/.local/share/piper/
+    if let Ok(home) = std::env::var("HOME") {
+        let mommy = PathBuf::from(&home).join(".local/share/piper/mommy_lessac.onnx");
+        if mommy.exists() {
+            return Some(mommy);
+        }
+    }
+
+    // 4. ~/.local/share/piper/*.onnx & ~/.local/share/kokoro/*.onnx
     if let Ok(home) = std::env::var("HOME") {
         for folder in &[".local/share/piper", ".local/share/kokoro"] {
             let dir = PathBuf::from(&home).join(folder);
@@ -156,11 +152,14 @@ pub fn compute_lipsync_schedule(wav: &[u8], chunk_ms: u64) -> Vec<(u64, bool)> {
         u16::from_le_bytes([wav[34], wav[35]]) as u64;
     let bytes_per_sample = (bits_per_sample / 8).max(1);
 
-    if sample_rate == 0 {
-        return vec![];
-    }
+    let data_offset = wav
+        .windows(4)
+        .position(|w| w == b"data")
+        .map(|pos| pos + 8)
+        .unwrap_or(44)
+        .min(wav.len());
 
-    let pcm = &wav[44..];
+    let pcm = &wav[data_offset..];
     let samples_per_chunk = ((sample_rate * chunk_ms) / 1000) as usize;
     let bytes_per_chunk = (samples_per_chunk * bytes_per_sample as usize).max(2);
 
@@ -555,10 +554,12 @@ async fn generate_openai_speech(
     config: &AppConfig,
     output_wav: &str,
 ) -> Result<(), String> {
-    let endpoint = if config.openai_speech_endpoint.trim().is_empty() {
-        "https://api.openai.com/v1/audio/speech"
-    } else {
+    let endpoint = if !config.openai_speech_endpoint.trim().is_empty() {
         config.openai_speech_endpoint.trim()
+    } else if !config.colab_clone_endpoint.trim().is_empty() {
+        config.colab_clone_endpoint.trim()
+    } else {
+        "https://api.openai.com/v1/audio/speech"
     };
 
     let client = reqwest::Client::new();
@@ -613,6 +614,9 @@ async fn convert_mp3_to_wav(mp3_path: &str, wav_path: &str) -> Result<(), String
             "-y",
             "-i",
             mp3_path,
+            "-bitexact",
+            "-map_metadata",
+            "-1",
             "-f",
             "wav",
             "-ar",
@@ -636,18 +640,20 @@ async fn convert_mp3_to_wav(mp3_path: &str, wav_path: &str) -> Result<(), String
 
 /// Jalankan piper dengan teks dari stdin, output ke file WAV
 async fn generate_wav(text: &str, model: &PathBuf, output: &str) -> Result<(), String> {
-    let local_bin = std::env::var("HOME")
-        .map(|h| PathBuf::from(h).join(".local/bin/piper"))
-        .unwrap_or_default();
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    let share_bin = PathBuf::from(&home).join(".local/share/piper/bin/piper");
+    let local_bin = PathBuf::from(&home).join(".local/bin/piper");
 
-    let bin = if which_exists("piper").await {
+    let bin = if share_bin.exists() {
+        share_bin
+    } else if local_bin.exists() {
+        local_bin
+    } else if which_exists("piper").await {
         PathBuf::from("piper")
     } else if which_exists("piper-tts").await {
         PathBuf::from("piper-tts")
-    } else if local_bin.exists() {
-        local_bin
     } else {
-        return Err("Binary piper / piper-tts tidak ditemukan di PATH".into());
+        return Err("Binary piper / piper-tts tidak ditemukan di ~/.local/share/piper/bin/piper atau PATH".into());
     };
 
     let mut child = Command::new(&bin)

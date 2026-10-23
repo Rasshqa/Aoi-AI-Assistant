@@ -122,28 +122,32 @@ pub fn run() {
                             &provider,
                             gtk::STYLE_PROVIDER_PRIORITY_USER,
                         );
-                        if let Some(screen) = gtk::prelude::GtkWindowExt::screen(&gtk_win) {
-                            gtk::StyleContext::add_provider_for_screen(
-                                &screen,
-                                &provider,
-                                gtk::STYLE_PROVIDER_PRIORITY_USER,
-                            );
-                        }
                     }
 
                     let res = win.with_webview(|webview| {
                         let wv = webview.inner();
                         let rgba = gdk::RGBA::new(0.0, 0.0, 0.0, 0.0);
-                        println!(">>> SETTING WEBVIEW BG COLOR TO TRANSPARENT!");
                         wv.set_background_color(&rgba);
                     });
                     println!(">>> WITH_WEBVIEW RESULT: {:?}", res);
                 }
             }
 
+            if let Some(settings_win) = tauri::Manager::get_webview_window(app, "settings") {
+                #[cfg(target_os = "linux")]
+                {
+                    use webkit2gtk::WebViewExt;
+                    let _ = settings_win.with_webview(|webview| {
+                        let wv = webview.inner();
+                        let rgba = gdk::RGBA::new(9.0 / 255.0, 9.0 / 255.0, 11.0 / 255.0, 1.0);
+                        wv.set_background_color(&rgba);
+                    });
+                }
+            }
+
             tauri::async_runtime::spawn(async move {
-                // Posisikan window di pojok kanan bawah monitor aktif Hyprland agar tidak menutupi tengah layar
-                tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+                // Posisikan window di pojok kanan bawah monitor aktif Hyprland agar proporsional
+                tokio::time::sleep(tokio::time::Duration::from_millis(350)).await;
                 if let Ok(output) = tokio::process::Command::new("hyprctl")
                     .args(["monitors", "-j"])
                     .output()
@@ -156,14 +160,21 @@ pub fn run() {
                             if let Some(m) = focused {
                                 let w = m["width"].as_i64().unwrap_or(1920);
                                 let h = m["height"].as_i64().unwrap_or(1080);
-                                let target_x = (w - 170 - 20).max(0);
-                                let target_y = (h - 170 - 20).max(0);
-                                let dispatch_cmd = format!(
-                                    "hl.dsp.window.move({{ window = \"class:.*ai-hypr-assistant.*\", x = {}, y = {}, exact = true }})",
-                                    target_x, target_y
-                                );
+                                let target_x = (w - 340 - 24).max(0);
+                                let target_y = (h - 440 - 24).max(0);
+
+                                // 1. Set posisi langsung via Tauri Window API
+                                if let Some(main_win) = tauri::Manager::get_webview_window(&handle, "main") {
+                                    let _ = main_win.set_position(tauri::Position::Physical(tauri::PhysicalPosition {
+                                        x: target_x as i32,
+                                        y: target_y as i32,
+                                    }));
+                                }
+
+                                // 2. Fallback via hyprctl standar
+                                let move_arg = format!("exact {} {},class:^(ai-hypr-assistant)$", target_x, target_y);
                                 let _ = tokio::process::Command::new("hyprctl")
-                                    .args(["dispatch", &dispatch_cmd])
+                                    .args(["dispatch", "movewindowpixel", &move_arg])
                                     .output()
                                     .await;
                             }
@@ -211,7 +222,16 @@ pub fn run() {
             commands::set_active_cloned_voice,
             commands::delete_cloned_voice,
             commands::get_cloned_voice_sample,
+            commands::open_settings_window,
         ])
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                if window.label() == "settings" {
+                    let _ = window.hide();
+                    api.prevent_close();
+                }
+            }
+        })
         .run(tauri::generate_context!())
         .expect("error saat menjalankan Aoi AI Assistant");
 }
